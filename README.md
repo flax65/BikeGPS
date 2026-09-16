@@ -99,6 +99,12 @@ Cambio pagina col pulsante su `BUTTON_PIN` (default **GPIO0 = BOOT integrato**,
 attivo basso). Per un pulsante esterno cambia `BUTTON_PIN` nello sketch.
 Se il BLE è scollegato il valore diventa `---` e compare `no BLE`.
 
+## Display / hardware
+
+Lo sketch attuale usa un OLED **SSD1306 I2C 128x64**. In `docs/display-notes.md`
+ci sono pin, setup TFT_eSPI e il piano per passare a **LILYGO T-Display (1.14")**
+o **T-Display-S3 (1.9")** senza toccare il codice BLE.
+
 ## Note
 
 - Il `GPS_PROVIDER` richiede cielo aperto; all'interno può non agganciare.
