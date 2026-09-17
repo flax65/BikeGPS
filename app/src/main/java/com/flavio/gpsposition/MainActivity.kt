@@ -2,9 +2,12 @@ package com.flavio.gpsposition
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -28,6 +31,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -98,6 +102,27 @@ private fun hasLocationPermissions(context: Context): Boolean =
 private fun hasBluetoothPermissions(context: Context): Boolean =
     allGranted(context, bluetoothPermissions())
 
+private fun hasBackgroundLocation(context: Context): Boolean =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_BACKGROUND_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+    } else {
+        true
+    }
+
+/** Apre la pagina permessi dell'app (per impostare la posizione su "sempre"). */
+private fun openAppSettings(context: Context) {
+    runCatching {
+        context.startActivity(
+            Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", context.packageName, null)
+            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }
+}
+
 @Composable
 fun BikeScreen() {
     val context = LocalContext.current
@@ -109,6 +134,12 @@ fun BikeScreen() {
 
     var locationGranted by remember { mutableStateOf(hasLocationPermissions(context)) }
     var bluetoothGranted by remember { mutableStateOf(hasBluetoothPermissions(context)) }
+    var backgroundGranted by remember { mutableStateOf(hasBackgroundLocation(context)) }
+
+    // Avvio automatico: aprendo l'app parte subito (serve solo il permesso posizione).
+    LaunchedEffect(Unit) {
+        if (hasLocationPermissions(context)) RideService.start(context)
+    }
 
     // Avvio: serve solo la posizione. Le notifiche sono best effort.
     val startLauncher = rememberLauncherForActivityResult(
@@ -116,6 +147,7 @@ fun BikeScreen() {
     ) {
         locationGranted = hasLocationPermissions(context)
         bluetoothGranted = hasBluetoothPermissions(context)
+        backgroundGranted = hasBackgroundLocation(context)
         if (locationGranted) RideService.start(context)
     }
 
@@ -218,6 +250,27 @@ fun BikeScreen() {
                     }
                 }
             }
+        } else if (!backgroundGranted) {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Avvio automatico all'accensione", fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Per far partire da solo il GPS all'accensione del telefono, " +
+                            "imposta la posizione su \"Consenti sempre\".",
+                        color = Muted,
+                        fontSize = 12.sp
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = { openAppSettings(context) }) {
+                        Text("Apri impostazioni posizione")
+                    }
+                }
+            }
         }
 
         // --- AZIONI ---
@@ -242,7 +295,7 @@ fun BikeScreen() {
         }
 
         Text(
-            text = if (running) "Registrazione in corso…" else "Premi AVVIA per iniziare",
+            text = if (running) "Unità GPS attiva — dati verso l'ESP32" else "Premi AVVIA per iniziare",
             color = if (running) Green else Muted,
             fontSize = 12.sp,
             modifier = Modifier.fillMaxWidth(),

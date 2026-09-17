@@ -61,8 +61,12 @@ export ANDROID_HOME=/home/flavio/Android/Sdk
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Premi **AVVIA**: parte il foreground service (notifica "BikeGPS attivo"),
-continua anche a schermo spento. **STOP** ferma tutto.
+L'app **parte da sola** all'apertura (serve solo il permesso posizione) e si
+collega all'ESP32: il telefono fa da unità GPS. **STOP** ferma tutto.
+
+Per farla partire **anche all'accensione del telefono**, concedi la posizione
+"Consenti sempre" (Android 14+). L'app mostra una card con il collegamento alle
+impostazioni. Senza quel permesso l'avvio automatico funziona solo aprendo l'app.
 
 ## ESP32 (Arduino)
 
