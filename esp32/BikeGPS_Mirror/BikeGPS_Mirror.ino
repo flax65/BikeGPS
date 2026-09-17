@@ -18,6 +18,10 @@
  *   off 11 u8  satelliti
  *   off 12 u16 velocità max   (0.1 km/h)
  *
+ * In piu' l'ESP32 fa da CENTRAL BLE verso la cintura cardio
+ * (Heart Rate Service 0x180D) e ne mostra il battito in locale
+ * (pagina BATTITO). Il GPS resta del telefono.
+ *
  * Librerie: NimBLE-Arduino (>=2.x), Adafruit SSD1306, Adafruit GFX
  * Scheda:   ESP32 (qualsiasi variante con BLE e I2C)
  *
@@ -77,9 +81,14 @@ struct Telemetry {
   int      sat = 0;
   float    mx = 0;       // km/h
   uint32_t lastRx = 0;   // millis dell'ultimo pacchetto
+
+  // cardio letto localmente dall'ESP32 (non arriva dal telefono)
+  int      hr = 0;         // bpm
+  bool     hrContact = false;
+  uint32_t hrLastRx = 0;   // millis dell'ultimo battito
 } tel;
 
-enum Page { P_SPEED, P_DIST, P_TIME, P_AVG, P_MAX, P_ALT, P_SLOPE, P_SAT, PAGE_COUNT };
+enum Page { P_SPEED, P_DIST, P_TIME, P_AVG, P_MAX, P_ALT, P_SLOPE, P_SAT, P_HR, PAGE_COUNT };
 static uint8_t page = P_SPEED;
 
 // ---------------------------------------------------------------- parsing
@@ -139,6 +148,166 @@ class TelemetryCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+// ---------------------------------------------------------------- cardio (central BLE)
+// L'ESP32 legge la cintura cardio DIRETTAMENTE (Heart Rate Service 0x180D)
+// mentre resta peripheral verso il telefono. Il battito resta locale.
+#define HR_SERVICE_UUID "0000180d-0000-1000-8000-00805f9b34fb"
+#define HR_MEAS_UUID    "00002a37-0000-1000-8000-00805f9b34fb"
+
+enum HrState { HR_IDLE, HR_SCANNING, HR_CONNECTING, HR_READY };
+static HrState hrState = HR_IDLE;
+static NimBLEClient *hrClient = nullptr;
+static NimBLEAddress hrAddress;
+static volatile bool hrFound = false;
+static uint32_t hrNextTry = 0;
+
+static void parseHeartRate(const uint8_t *d, size_t n) {
+  if (n < 2) return;
+  uint8_t flags = d[0];
+  int bpm;
+  if (flags & 0x01) {                 // battito su 16 bit
+    if (n < 3) return;
+    bpm = d[1] | (d[2] << 8);
+  } else {
+    bpm = d[1];
+  }
+  bool contactSupported = flags & 0x04;
+  tel.hr = bpm;
+  tel.hrContact = contactSupported ? (flags & 0x02) : true;
+  tel.hrLastRx = millis();
+#if SERIAL_DEBUG
+  Serial.printf("hr bpm=%d contatto=%d\n", bpm, tel.hrContact);
+#endif
+}
+
+static void hrNotify(NimBLERemoteCharacteristic *, uint8_t *d, size_t n, bool) {
+  parseHeartRate(d, n);
+}
+
+class HrScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice *dev) override {
+    if (dev->isAdvertisingService(NimBLEUUID(HR_SERVICE_UUID))) {
+      hrAddress = dev->getAddress();
+      hrFound = true;
+#if SERIAL_DEBUG
+      Serial.printf("cardio trovato: %s [%s]\n",
+                    dev->haveName() ? dev->getName().c_str() : "?",
+                    dev->getAddress().toString().c_str());
+#endif
+    }
+#if SERIAL_DEBUG
+    else if (dev->haveName()) {
+      Serial.printf("scan: %s [%s]\n", dev->getName().c_str(),
+                    dev->getAddress().toString().c_str());
+    }
+#endif
+  }
+};
+static HrScanCallbacks hrScanCallbacks;
+
+static bool hrConnect() {
+  if (hrClient == nullptr) hrClient = NimBLEDevice::createClient();
+  if (hrClient == nullptr) {
+#if SERIAL_DEBUG
+    Serial.println("hr: createClient null");
+#endif
+    return false;
+  }
+#if SERIAL_DEBUG
+  Serial.println("hr: connessione...");
+#endif
+  if (!hrClient->connect(hrAddress)) {
+#if SERIAL_DEBUG
+    Serial.println("hr: connect fallita");
+#endif
+    NimBLEDevice::deleteClient(hrClient);
+    hrClient = nullptr;
+    return false;
+  }
+#if SERIAL_DEBUG
+  Serial.println("hr: connesso");
+#endif
+  NimBLERemoteService *svc = hrClient->getService(HR_SERVICE_UUID);
+  if (svc == nullptr) {
+#if SERIAL_DEBUG
+    Serial.println("hr: servizio mancante");
+#endif
+    hrClient->disconnect();
+    return false;
+  }
+  NimBLERemoteCharacteristic *ch = svc->getCharacteristic(HR_MEAS_UUID);
+  if (ch == nullptr) {
+#if SERIAL_DEBUG
+    Serial.println("hr: char mancante");
+#endif
+    hrClient->disconnect();
+    return false;
+  }
+  if (!ch->subscribe(true, hrNotify)) {
+#if SERIAL_DEBUG
+    Serial.println("hr: subscribe fallita");
+#endif
+    hrClient->disconnect();
+    return false;
+  }
+  // Ora che le notifiche sono attive passo all'intervallo lungo (~1 s)
+  // che la Geonaute pretende; la discovery resta veloce.
+  hrClient->updateConnParams(800, 800, 0, 600);
+#if SERIAL_DEBUG
+  Serial.println("cardio pronto");
+#endif
+  return true;
+}
+
+static void hrTask() {
+  switch (hrState) {
+    case HR_IDLE:
+      if (millis() >= hrNextTry) {
+        hrFound = false;
+        hrState = HR_SCANNING;
+      }
+      break;
+
+    case HR_SCANNING: {
+      NimBLEScan *scan = NimBLEDevice::getScan();
+      if (!hrFound && !scan->isScanning()) {
+        scan->setScanCallbacks(&hrScanCallbacks, false);
+        scan->setActiveScan(true);
+        bool ok = scan->start(0, true, false);   // continua finche' non trovata
+#if SERIAL_DEBUG
+        if (!ok) Serial.println("scan cardio non avviato");
+#endif
+      }
+      if (hrFound) {
+        scan->stop();
+        hrState = HR_CONNECTING;
+      }
+      break;
+    }
+
+    case HR_CONNECTING:
+      if (hrConnect()) {
+        hrState = HR_READY;
+      } else {
+        hrNextTry = millis() + 5000;
+        hrState = HR_IDLE;
+      }
+      break;
+
+    case HR_READY:
+      if (hrClient == nullptr || !hrClient->isConnected()) {
+        if (hrClient != nullptr) {
+          NimBLEDevice::deleteClient(hrClient);
+          hrClient = nullptr;
+        }
+        tel.hr = 0;
+        hrNextTry = millis() + 2000;
+        hrState = HR_IDLE;
+      }
+      break;
+  }
+}
+
 // ---------------------------------------------------------------- pagine
 static const char *pageLabel(uint8_t p) {
   switch (p) {
@@ -150,6 +319,7 @@ static const char *pageLabel(uint8_t p) {
     case P_ALT:   return "QUOTA      m";
     case P_SLOPE: return "PENDENZA   %";
     case P_SAT:   return "SATELLITI";
+    case P_HR:    return "BATTITO    bpm";
   }
   return "";
 }
@@ -173,6 +343,10 @@ static void pageValue(uint8_t p, char *buf, size_t n) {
     case P_ALT:   snprintf(buf, n, "%d", tel.alt); break;
     case P_SLOPE: snprintf(buf, n, "%+.1f", tel.slp); break;
     case P_SAT:   snprintf(buf, n, "%d", tel.sat); break;
+    case P_HR:
+      if (tel.hr > 0) snprintf(buf, n, "%d", tel.hr);
+      else            snprintf(buf, n, "--");
+      break;
     default:      buf[0] = '\0';
   }
 }
@@ -183,7 +357,9 @@ static int textWidth(const char *s, uint8_t size) {
 
 // ---------------------------------------------------------------- display
 static void drawScreen() {
-  bool live = bleConnected && tel.lastRx != 0 && (millis() - tel.lastRx <= 5000);
+  bool live;
+  if (page == P_HR) live = tel.hrLastRx != 0 && (millis() - tel.hrLastRx <= 5000);
+  else              live = bleConnected && tel.lastRx != 0 && (millis() - tel.lastRx <= 5000);
 
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -212,8 +388,14 @@ static void drawScreen() {
   display.setCursor((SCREEN_W - w) / 2, BLUE_Y + (BLUE_H - h) / 2);
   display.print(val);
 
-  // --- stato BLE in basso a destra nell'area blu ---
-  if (!bleConnected) {
+  // --- stato BLE / cardio in basso a destra nell'area blu ---
+  if (page == P_HR) {
+    if (!live) {
+      display.setTextSize(1);
+      display.setCursor(SCREEN_W - textWidth("no HR", 1), SCREEN_H - 8);
+      display.print("no HR");
+    }
+  } else if (!bleConnected) {
     display.setTextSize(1);
     display.setCursor(SCREEN_W - textWidth("no BLE", 1), SCREEN_H - 8);
     display.print("no BLE");
@@ -287,6 +469,7 @@ void setup() {
 // ---------------------------------------------------------------- loop
 void loop() {
   handleButton();
+  hrTask();
 
   static uint32_t lastDraw = 0;
   if (millis() - lastDraw >= 200) {

@@ -11,8 +11,10 @@ Nessuna dipendenza da Google Play Services: posizione con `android.location`.
 ```
 [Telefono]                                   [ESP32 + SSD1306]
  GPS nativo (GPS_PROVIDER)                     NimBLE peripheral "BikeGPS"
- RideCalculator (dist/media/pendenza)  --BLE-->  riceve CSV
+ RideCalculator (dist/media/pendenza)  --BLE-->  riceve binario (14 B)
  Foreground service (schermo spento)             mostra velocità + info
+                                               NimBLE central --BLE--> cintura cardio
+                                                          (Heart Rate 0x180D)
 ```
 
 - **Trasporto**: BLE, ESP32 = peripheral, telefono = central.
@@ -86,7 +88,7 @@ nell'area blu; l'etichetta+unità e l'indice pagina stanno nella banda gialla:
 
 ```
 ┌─ gialla (0..15) ─────────┐
-│ VELOCITA' km/h      1/8  │
+│ VELOCITA' km/h      1/9  │
 ├─ blu (16..63) ───────────┤
 │                          │
 │          27.4            │
@@ -94,10 +96,28 @@ nell'area blu; l'etichetta+unità e l'indice pagina stanno nella banda gialla:
 └──────────────────────────┘
 ```
 
-Pagine: Velocità · Distanza · Tempo · Media · Max · Quota · Pendenza · Satelliti.
+Pagine: Velocità · Distanza · Tempo · Media · Max · Quota · Pendenza · Satelliti · Battito.
 Cambio pagina col pulsante su `BUTTON_PIN` (default **GPIO0 = BOOT integrato**,
 attivo basso). Per un pulsante esterno cambia `BUTTON_PIN` nello sketch.
-Se il BLE è scollegato il valore diventa `---` e compare `no BLE`.
+Se il BLE è scollegato il valore diventa `---` e compare `no BLE`
+(sulla pagina Battito compare `no HR` se la cintura non è connessa).
+
+## Cardio (letto dall'ESP32)
+
+L'ESP32 fa anche da **central BLE** verso un cardiofrequenzimetro standard
+(Heart Rate Service `0x180D`, characteristic `0x2A37`): Geonaute/Decathlon, Polar,
+Garmin, Wahoo, ecc.
+
+Perché qui e non sul telefono: alcune cinture (Geonaute) pretendono un intervallo
+di connessione lungo (~1 s) che la cintura stessa richiede. Android lo impone a
+~45-100 ms e la cintura smette di trasmettere, mentre l'ESP32 può impostarlo
+(`setConnectionParams`/`updateConnParams`) e quindi funziona in modo affidabile.
+
+- Connessione: appena acceso l'ESP32 cerca la cintura e si connette (1-3 s); se
+  cade, si riconnette da solo.
+- Il battito è **locale**: pagina **Battito** sull'OLED (bpm + contatto).
+- Il telefono **non** legge il cardio; invia solo GPS e riceve/calcola le statistiche
+  di uscita.
 
 ## Display / hardware
 
