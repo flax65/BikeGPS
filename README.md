@@ -78,6 +78,11 @@ L'app legge anche un **cardiofrequenzimetro BLE standard** (Heart Rate Service
   lo stesso.
 - Permessi: usa gli stessi permessi Bluetooth del mirror, quindi vanno concessi
   (card *"BLE non attivo (opzionale)"*).
+- Se la cintura si connette (stato *pronto*) ma il battito resta `--` e la
+  connessione cade dopo pochi secondi, il sospetto numero uno è la **batteria
+  scarica** (CR2032): con pila quasi esaurita la radio smette di rispondere
+  (supervision timeout) pur riuscendo ad annunciarsi e connettersi.
+- Il mirror è indipendente: eventuali problemi della cintura non fermano GPS o ESP32.
 
 ## ESP32 (Arduino)
 

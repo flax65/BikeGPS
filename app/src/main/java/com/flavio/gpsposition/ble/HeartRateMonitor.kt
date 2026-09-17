@@ -49,6 +49,7 @@ class HeartRateMonitor(
         private const val SCAN_TIMEOUT_MS = 15_000L
         private const val RETRY_MS = 5_000L
         private const val RECONNECT_MS = 2_000L
+        private const val TAG = "HeartRate"
     }
 
     private val appContext = context.applicationContext
@@ -58,8 +59,24 @@ class HeartRateMonitor(
     private val main = Handler(Looper.getMainLooper())
 
     private var gatt: BluetoothGatt? = null
+    private var measurement: BluetoothGattCharacteristic? = null
     private var wantConnected = false
     private var scanning = false
+    private var gotNotification = false
+
+    /**
+     * Alcune cinture non inviano notifiche (o le interrompono): leggo periodicamente
+     * la caratteristica. Tiene vivo il link e recupera comunque il battito.
+     */
+    private val poll = object : Runnable {
+        override fun run() {
+            if (!wantConnected || gotNotification) return
+            val g = gatt ?: return
+            val ch = measurement ?: return
+            runCatching { g.readCharacteristic(ch) }
+            main.postDelayed(this, 2_000L)
+        }
+    }
 
     private val scanTimeout = Runnable {
         if (!scanning) return@Runnable
@@ -80,6 +97,7 @@ class HeartRateMonitor(
     fun stop() {
         wantConnected = false
         main.removeCallbacks(scanTimeout)
+        main.removeCallbacks(poll)
         stopScan()
         closeGatt()
         onStatus("Cardio: spento")
@@ -147,6 +165,8 @@ class HeartRateMonitor(
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             val device = result?.device ?: return
+            @SuppressLint("MissingPermission")
+            Log.d(TAG, "trovato ${device.name ?: "?"} (${device.address}) rssi=${result.rssi}")
             stopScan()
             connect(device)
         }
@@ -162,6 +182,7 @@ class HeartRateMonitor(
     private fun connect(device: BluetoothDevice) {
         closeGatt()
         onStatus("Cardio: connessione…")
+        Log.d(TAG, "connect ${device.name ?: "?"} (${device.address})")
         runCatching {
             gatt = device.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         }.onFailure { onStatus("Cardio: connessione fallita"); retryLater() }
@@ -169,8 +190,11 @@ class HeartRateMonitor(
 
     @SuppressLint("MissingPermission")
     private fun closeGatt() {
+        main.removeCallbacks(poll)
         runCatching { gatt?.close() }
         gatt = null
+        measurement = null
+        gotNotification = false
     }
 
     private fun retryLater(delayMs: Long = RECONNECT_MS) {
@@ -183,10 +207,14 @@ class HeartRateMonitor(
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
+                    Log.d(TAG, "connected status=$status bond=${g.device.bondState}")
                     onStatus("Cardio: connesso, configuro…")
-                    runCatching { g.discoverServices() }
+                    runCatching {
+                        g.discoverServices()
+                    }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
+                    Log.d(TAG, "disconnected status=$status bond=${g.device.bondState}")
                     onStatus("Cardio: disconnesso")
                     closeGatt()
                     retryLater()
@@ -203,21 +231,36 @@ class HeartRateMonitor(
                 retryLater()
                 return
             }
+            measurement = ch
+            Log.d(TAG, "2A37 properties=0x${Integer.toHexString(ch.properties)}")
             runCatching { g.setCharacteristicNotification(ch, true) }
             val cccd = ch.getDescriptor(CCCD)
             if (cccd == null) {
+                Log.d(TAG, "CCCD non trovato")
                 onStatus("Cardio: notifiche non disponibili")
                 return
             }
+            // Scegli il valore giusto: Notify se supportato, altrimenti Indicate.
+            val cccdValue = when {
+                ch.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0 ->
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0 ->
+                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                else -> BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            }
+            Log.d(TAG, "CCCD value=${cccdValue.joinToString("") { "%02x".format(it) }}")
             runCatching {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    g.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                val ret = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    g.writeDescriptor(cccd, cccdValue)
                 } else {
                     @Suppress("DEPRECATION")
-                    cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    cccd.value = cccdValue
                     @Suppress("DEPRECATION")
                     g.writeDescriptor(cccd)
+                    0
                 }
+                Log.d(TAG, "writeDescriptor ret=$ret")
+                if (ret != 0) onStatus("Cardio: errore notifiche ($ret)")
             }.onFailure { onStatus("Cardio: errore notifiche") }
         }
 
@@ -226,7 +269,24 @@ class HeartRateMonitor(
             descriptor: BluetoothGattDescriptor,
             status: Int,
         ) {
-            if (descriptor.uuid == CCCD) onStatus("Cardio: pronto")
+            if (descriptor.uuid != CCCD) return
+            Log.d(TAG, "onDescriptorWrite status=$status")
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                onStatus("Cardio: pronto")
+                // fallback: se 2A37 è leggibile, leggo subito e poi periodicamente
+                val ch = measurement
+                if (ch != null &&
+                    ch.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0
+                ) {
+                    runCatching { g.readCharacteristic(ch) }
+                    main.removeCallbacks(poll)
+                    main.postDelayed(poll, 1_500L)
+                } else {
+                    Log.d(TAG, "2A37 senza proprietà READ: solo notifiche")
+                }
+            } else {
+                onStatus("Cardio: notifiche negate ($status)")
+            }
         }
 
         // Android 13+
@@ -235,7 +295,11 @@ class HeartRateMonitor(
             ch: BluetoothGattCharacteristic,
             value: ByteArray,
         ) {
-            if (ch.uuid == HR_MEASUREMENT) emit(value)
+            if (ch.uuid == HR_MEASUREMENT) {
+                gotNotification = true
+                main.removeCallbacks(poll)
+                emit(value)
+            }
         }
 
         // Android 12 e precedenti
@@ -243,7 +307,35 @@ class HeartRateMonitor(
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
             if (ch.uuid == HR_MEASUREMENT) {
                 @Suppress("DEPRECATION")
-                emit(ch.value ?: return)
+                val value = ch.value ?: return
+                gotNotification = true
+                main.removeCallbacks(poll)
+                emit(value)
+            }
+        }
+
+        // Lettura diretta (fallback): Android 13+
+        override fun onCharacteristicRead(
+            g: BluetoothGatt,
+            ch: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int,
+        ) {
+            Log.d(TAG, "onCharacteristicRead status=$status size=${value.size}")
+            if (ch.uuid == HR_MEASUREMENT && status == BluetoothGatt.GATT_SUCCESS) emit(value)
+        }
+
+        // Lettura diretta (fallback): Android 12 e precedenti
+        @Deprecated("Deprecated in API 33")
+        override fun onCharacteristicRead(
+            g: BluetoothGatt,
+            ch: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            if (ch.uuid == HR_MEASUREMENT && status == BluetoothGatt.GATT_SUCCESS) {
+                @Suppress("DEPRECATION")
+                val value = ch.value ?: return
+                emit(value)
             }
         }
     }
