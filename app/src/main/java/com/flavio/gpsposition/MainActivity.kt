@@ -48,6 +48,8 @@ import com.flavio.gpsposition.ui.theme.Accent
 import com.flavio.gpsposition.ui.theme.GpsPositionTheme
 import com.flavio.gpsposition.ui.theme.Green
 import com.flavio.gpsposition.ui.theme.Muted
+import com.flavio.gpsposition.ui.theme.Red
+import com.flavio.gpsposition.ui.theme.Yellow
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -104,7 +106,9 @@ fun BikeScreen() {
 
     val location by RideState.location.collectAsState()
     val stats by RideState.stats.collectAsState()
+    val heartRate by RideState.heartRate.collectAsState()
     val bleStatus by RideState.bleStatus.collectAsState()
+    val hrStatus by RideState.hrStatus.collectAsState()
     val running by RideState.running.collectAsState()
 
     var locationGranted by remember { mutableStateOf(hasLocationPermissions(context)) }
@@ -162,12 +166,47 @@ fun BikeScreen() {
             }
         }
 
+        // --- CARDIO ---
+        Card(Modifier.fillMaxWidth()) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column {
+                    Text("BATTITO", color = Muted, fontSize = 12.sp, letterSpacing = 2.sp)
+                    Text(
+                        text = if (heartRate.connected && heartRate.bpm > 0)
+                            heartRate.bpm.toString() else "--",
+                        fontSize = 40.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Red
+                    )
+                }
+                Column(horizontalAlignment = Alignment.End) {
+                    Text("bpm", color = Muted)
+                    Text(
+                        text = when {
+                            !heartRate.connected -> "non connesso"
+                            !heartRate.contact -> "no contatto"
+                            else -> "ok"
+                        },
+                        color = if (heartRate.connected && heartRate.contact) Green else Yellow,
+                        fontSize = 12.sp
+                    )
+                }
+            }
+        }
+
         // --- STATO ---
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp)) {
                 SectionTitle("STATO")
                 InfoRow("Servizio", if (running) "attivo" else "fermo")
                 InfoRow("BLE", bleStatus)
+                InfoRow("Cardio", hrStatus)
                 InfoRow("Satelliti", location.satellitesUsed?.toString() ?: "--")
                 InfoRow("Provider", location.provider.ifBlank { "--" })
             }

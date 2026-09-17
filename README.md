@@ -11,8 +11,9 @@ Nessuna dipendenza da Google Play Services: posizione con `android.location`.
 ```
 [Telefono]                                   [ESP32 + SSD1306]
  GPS nativo (GPS_PROVIDER)                     NimBLE peripheral "BikeGPS"
- RideCalculator (dist/media/pendenza)  --BLE-->  riceve CSV
- Foreground service (schermo spento)             mostra velocità + info
+ RideCalculator (dist/media/pendenza)  --BLE-->  riceve binario
+ Cardio BLE 0x180D (bpm)                        mostra velocità + info
+ Foreground service (schermo spento)
 ```
 
 - **Trasporto**: BLE, ESP32 = peripheral, telefono = central.
@@ -26,7 +27,7 @@ Nessuna dipendenza da Google Play Services: posizione con `android.location`.
 | Service | `0000a001-0000-1000-8000-00805f9b34fb` |
 | Telemetry (Write Without Response) | `0000a002-0000-1000-8000-00805f9b34fb` |
 
-MTU negoziato a 64. Payload **binario compatto da 14 byte** (little-endian), così entra
+MTU negoziato a 64. Payload **binario compatto da 15 byte** (little-endian), così entra
 anche nel caso peggiore di MTU 23:
 
 | Offset | Tipo | Campo | Unità |
@@ -38,6 +39,7 @@ anche nel caso peggiore di MTU 23:
 | 10 | i8 | pendenza | 0.5 % |
 | 11 | u8 | satelliti | — |
 | 12 | u16 | velocità max | 0.1 km/h |
+| 14 | u8 | battito | bpm (0 = nessun cardio) |
 
 ## App Android
 
@@ -45,7 +47,9 @@ Pacchetti:
 - `location/GpsTracker.kt` — GPS nativo (`LocationManager` + `GnssStatus`)
 - `ride/RideStats.kt` — distanza (Haversine), tempo in movimento, media/max, pendenza, payload
 - `ride/RideState.kt` — stato condiviso service ↔ UI (`StateFlow`)
+- `ride/HeartRate.kt` — stato del cardio (bpm, contatto)
 - `ble/BleMirror.kt` — central BLE con riconnessione automatica
+- `ble/HeartRateMonitor.kt` — central BLE per cardio standard (Heart Rate Service)
 - `service/RideService.kt` — foreground service tipo `location`
 - `MainActivity.kt` — UI + permessi
 
@@ -61,6 +65,19 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 Premi **AVVIA**: parte il foreground service (notifica "BikeGPS attivo"),
 continua anche a schermo spento. **STOP** ferma tutto.
+
+## Cardio BLE (opzionale)
+
+L'app legge anche un **cardiofrequenzimetro BLE standard** (Heart Rate Service
+`0x180D`, characteristic `0x2A37`): Geonaute/Decathlon, Polar, Garmin, Wahoo, ecc.
+
+- Basta accendere il cardio e indossarlo: l'app lo cerca e si connette da sola,
+  riceve il battito via notifiche BLE e lo mostra a schermo.
+- Il battito viene incluso nel payload verso l'ESP32 (pagina **Battito**).
+- È indipendente sia dal GPS sia dall'ESP32: se il cardio non c'è, l'app funziona
+  lo stesso.
+- Permessi: usa gli stessi permessi Bluetooth del mirror, quindi vanno concessi
+  (card *"BLE non attivo (opzionale)"*).
 
 ## ESP32 (Arduino)
 
@@ -94,7 +111,7 @@ nell'area blu; l'etichetta+unità e l'indice pagina stanno nella banda gialla:
 └──────────────────────────┘
 ```
 
-Pagine: Velocità · Distanza · Tempo · Media · Max · Quota · Pendenza · Satelliti.
+Pagine: Velocità · Distanza · Tempo · Media · Max · Quota · Pendenza · Satelliti · Battito.
 Cambio pagina col pulsante su `BUTTON_PIN` (default **GPIO0 = BOOT integrato**,
 attivo basso). Per un pulsante esterno cambia `BUTTON_PIN` nello sketch.
 Se il BLE è scollegato il valore diventa `---` e compare `no BLE`.

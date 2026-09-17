@@ -96,7 +96,7 @@ fun haversine(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
 }
 
 /**
- * Costruisce il pacchetto BLE binario compatto (14 byte, entra in MTU 23).
+ * Costruisce il pacchetto BLE binario compatto (15 byte, entra in MTU 23).
  * Little-endian:
  *   0  u16  velocità         (0.1 km/h)
  *   2  u32  distanza         (0.01 km)
@@ -105,9 +105,10 @@ fun haversine(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
  *  10  i8   pendenza         (0.5 %)
  *  11  u8   satelliti
  *  12  u16  velocità max     (0.1 km/h)
+ *  14  u8   battito         (bpm, 0 = nessun cardio)
  */
-fun telemetryPayload(s: LocationState, st: RideStats): ByteArray {
-    val buf = ByteBuffer.allocate(14).order(ByteOrder.LITTLE_ENDIAN)
+fun telemetryPayload(s: LocationState, st: RideStats, heartRateBpm: Int = 0): ByteArray {
+    val buf = ByteBuffer.allocate(15).order(ByteOrder.LITTLE_ENDIAN)
     buf.putShort((s.speedKmh * 10f).toInt().coerceIn(0, 65535).toShort())
     buf.putInt((st.distanceKm * 100.0).toLong().coerceIn(0L, 0xFFFFFFFFL).toInt())
     buf.putShort(st.movingSec.coerceIn(0L, 65535L).toShort())
@@ -115,5 +116,6 @@ fun telemetryPayload(s: LocationState, st: RideStats): ByteArray {
     buf.put((st.slopePct * 2f).toInt().coerceIn(-128, 127).toByte())
     buf.put((s.satellitesUsed ?: 0).coerceIn(0, 255).toByte())
     buf.putShort((st.maxSpeedKmh * 10f).toInt().coerceIn(0, 65535).toShort())
+    buf.put(heartRateBpm.coerceIn(0, 255).toByte())
     return buf.array()
 }

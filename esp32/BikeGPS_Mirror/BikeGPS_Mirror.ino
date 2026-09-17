@@ -9,7 +9,7 @@
  * Il pulsante cambia pagina. Di default usa il pulsante BOOT
  * integrato (GPIO0); per un pulsante esterno cambia BUTTON_PIN.
  *
- * Payload ricevuto (binario little-endian, 14 byte):
+ * Payload ricevuto (binario little-endian, 15 byte):
  *   off 0  u16 velocità       (0.1 km/h)
  *   off 2  u32 distanza       (0.01 km)
  *   off 6  u16 tempo movimento(s)
@@ -17,6 +17,7 @@
  *   off 10 i8  pendenza       (0.5 %)
  *   off 11 u8  satelliti
  *   off 12 u16 velocità max   (0.1 km/h)
+ *   off 14 u8  battito        (bpm, 0 = nessun cardio)
  *
  * Librerie: NimBLE-Arduino (>=2.x), Adafruit SSD1306, Adafruit GFX
  * Scheda:   ESP32 (qualsiasi variante con BLE e I2C)
@@ -75,11 +76,12 @@ struct Telemetry {
   int      alt = 0;      // m
   float    slp = 0;      // %
   int      sat = 0;
+  int      hr = 0;       // bpm
   float    mx = 0;       // km/h
   uint32_t lastRx = 0;   // millis dell'ultimo pacchetto
 } tel;
 
-enum Page { P_SPEED, P_DIST, P_TIME, P_AVG, P_MAX, P_ALT, P_SLOPE, P_SAT, PAGE_COUNT };
+enum Page { P_SPEED, P_DIST, P_TIME, P_AVG, P_MAX, P_ALT, P_SLOPE, P_SAT, P_HR, PAGE_COUNT };
 static uint8_t page = P_SPEED;
 
 // ---------------------------------------------------------------- parsing
@@ -92,6 +94,7 @@ struct __attribute__((packed)) TelemetryPacket {
   int8_t   slp2;
   uint8_t  sat;
   uint16_t max10;
+  uint8_t  hr;
 };
 
 static void parsePayload(const uint8_t *data, size_t len) {
@@ -106,11 +109,12 @@ static void parsePayload(const uint8_t *data, size_t len) {
   tel.slp = p.slp2 / 2.0f;
   tel.sat = p.sat;
   tel.mx  = p.max10 / 10.0f;
+  tel.hr  = p.hr;
   tel.lastRx = millis();
 
 #if SERIAL_DEBUG
-  Serial.printf("rx spd=%.1f dst=%.2f mov=%lu alt=%d slp=%.1f sat=%d mx=%.1f\n",
-                tel.spd, tel.dst, (unsigned long)tel.mov, tel.alt, tel.slp, tel.sat, tel.mx);
+  Serial.printf("rx spd=%.1f dst=%.2f mov=%lu alt=%d slp=%.1f sat=%d mx=%.1f hr=%d\n",
+                tel.spd, tel.dst, (unsigned long)tel.mov, tel.alt, tel.slp, tel.sat, tel.mx, tel.hr);
 #endif
 }
 
@@ -150,6 +154,7 @@ static const char *pageLabel(uint8_t p) {
     case P_ALT:   return "QUOTA      m";
     case P_SLOPE: return "PENDENZA   %";
     case P_SAT:   return "SATELLITI";
+    case P_HR:    return "BATTITO    bpm";
   }
   return "";
 }
@@ -173,6 +178,10 @@ static void pageValue(uint8_t p, char *buf, size_t n) {
     case P_ALT:   snprintf(buf, n, "%d", tel.alt); break;
     case P_SLOPE: snprintf(buf, n, "%+.1f", tel.slp); break;
     case P_SAT:   snprintf(buf, n, "%d", tel.sat); break;
+    case P_HR:
+      if (tel.hr > 0) snprintf(buf, n, "%d", tel.hr);
+      else            snprintf(buf, n, "--");
+      break;
     default:      buf[0] = '\0';
   }
 }
