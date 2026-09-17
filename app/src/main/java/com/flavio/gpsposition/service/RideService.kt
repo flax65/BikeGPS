@@ -14,7 +14,6 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.flavio.gpsposition.R
 import com.flavio.gpsposition.ble.BleMirror
-import com.flavio.gpsposition.ble.HeartRateMonitor
 import com.flavio.gpsposition.location.GpsTracker
 import com.flavio.gpsposition.location.LocationState
 import com.flavio.gpsposition.ride.RideCalculator
@@ -48,7 +47,6 @@ class RideService : Service() {
 
     private lateinit var tracker: GpsTracker
     private lateinit var ble: BleMirror
-    private lateinit var hr: HeartRateMonitor
     private val calc = RideCalculator()
     private var running = false
 
@@ -59,11 +57,6 @@ class RideService : Service() {
         createChannel()
         tracker = GpsTracker(this) { onLocation(it) }
         ble = BleMirror(this) { status -> RideState.bleStatus.value = status }
-        hr = HeartRateMonitor(
-            this,
-            onStatus = { status -> RideState.hrStatus.value = status },
-            onHeartRate = { sample -> RideState.heartRate.value = sample }
-        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -92,10 +85,6 @@ class RideService : Service() {
         // Il BLE è opzionale: un suo errore non deve fermare la registrazione.
         runCatching { ble.start() }
             .onFailure { RideState.bleStatus.value = "BLE: errore" }
-
-        // Anche il cardio è opzionale e indipendente da GPS e ESP32.
-        runCatching { hr.start() }
-            .onFailure { RideState.hrStatus.value = "Cardio: errore" }
     }
 
     private fun stopEverything() {
@@ -103,7 +92,6 @@ class RideService : Service() {
         running = false
         runCatching { tracker.stop() }
         runCatching { ble.stop() }
-        runCatching { hr.stop() }
         RideState.running.value = false
     }
 
@@ -111,7 +99,7 @@ class RideService : Service() {
         val stats = calc.update(s)
         RideState.location.value = s
         RideState.stats.value = stats
-        ble.send(telemetryPayload(s, stats, RideState.heartRate.value.bpm))
+        ble.send(telemetryPayload(s, stats))
         notifyNotification(s, stats)
     }
 

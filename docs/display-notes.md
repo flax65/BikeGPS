@@ -53,7 +53,7 @@ con nessuna di queste schede: cambia solo la parte di disegno nello sketch.
 
 1. Nuovo sketch separato `BikeGPS_TDisplay/` (o `BikeGPS_TDisplayS3/`) **senza
    toccare** quello SSD1306.
-2. Stesso codice BLE + parsing binario (15 byte), cambia solo il disegno.
+2. Stesso codice BLE + parsing binario (14 byte), cambia solo il disegno.
 3. Layout landscape (320×170 o 240×135): velocità grande + 2-3 info
    (distanza/tempo), batteria e satelliti.
 4. Pagine con i pulsanti integrati (GPIO0/GPIO35 sul T-Display, GPIO0/GPIO14 sul S3).
