@@ -26,6 +26,10 @@ import java.util.UUID
 /**
  * Client BLE (central) che cerca l'ESP32 "BikeGPS" e gli invia il pacchetto telemetria
  * scrivendo una caratteristica Write-Without-Response. Si riconnette da solo.
+ *
+ * IMPORTANTE: è completamente opzionale. Se il Bluetooth è spento, i permessi mancano
+ * o l'ESP32 non viene trovato, questa classe si limita a segnalare lo stato e a
+ * riprovare in background: non blocca né fa crashare la registrazione GPS.
  */
 class BleMirror(
     context: Context,
@@ -34,6 +38,15 @@ class BleMirror(
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("0000a001-0000-1000-8000-00805f9b34fb")
         val TELEMETRY_UUID: UUID = UUID.fromString("0000a002-0000-1000-8000-00805f9b34fb")
+
+        /** Dopo quanto rinuncio alla scansione corrente e riprovo. */
+        private const val SCAN_TIMEOUT_MS = 15_000L
+
+        /** Attesa tra un tentativo e il successivo. */
+        private const val RETRY_MS = 5_000L
+
+        /** Attesa prima di ritentare la connessione dopo una disconnessione. */
+        private const val RECONNECT_MS = 2_000L
     }
 
     private val appContext = context.applicationContext
@@ -49,13 +62,18 @@ class BleMirror(
     private var mtu = 23
     private var pending: ByteArray? = null
 
+    /** Chiamato quando la scansione va in timeout: nessun ESP32 trovato. */
+    private val scanTimeout = Runnable {
+        if (!scanning) return@Runnable
+        stopScan()
+        onStatus("BLE: ESP32 non trovato")
+        retryLater(RETRY_MS)
+    }
+
+    /** Avvia il mirror BLE. Non lancia eccezioni: ogni errore diventa uno stato. */
     fun start() {
-        if (adapter == null || !adapter.isEnabled) {
-            onStatus("BLE: adattatore spento")
-            return
-        }
-        if (!hasPermissions()) {
-            onStatus("BLE: permessi mancanti")
+        if (adapter == null) {
+            onStatus("BLE: non disponibile")
             return
         }
         wantConnected = true
@@ -64,6 +82,7 @@ class BleMirror(
 
     fun stop() {
         wantConnected = false
+        main.removeCallbacks(scanTimeout)
         stopScan()
         closeGatt()
         onStatus("BLE: spento")
@@ -81,7 +100,28 @@ class BleMirror(
     @SuppressLint("MissingPermission")
     private fun startScan() {
         if (scanning || !wantConnected) return
-        val s = scanner ?: return
+        val a = adapter ?: return
+
+        // I permessi possono arrivare dopo l'avvio: in tal caso riprovo, così il BLE
+        // parte da solo appena l'utente li concede (senza riavviare il servizio).
+        if (!hasPermissions()) {
+            onStatus("BLE: permessi mancanti")
+            retryLater(RETRY_MS)
+            return
+        }
+        if (!a.isEnabled) {
+            onStatus("BLE: adattatore spento")
+            retryLater(RETRY_MS)
+            return
+        }
+
+        val s = scanner
+        if (s == null) {
+            onStatus("BLE: scanner non disponibile")
+            retryLater(RETRY_MS)
+            return
+        }
+
         scanning = true
         onStatus("BLE: ricerca ESP32…")
         val filter = ScanFilter.Builder()
@@ -90,12 +130,20 @@ class BleMirror(
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
+
+        main.removeCallbacks(scanTimeout)
         runCatching { s.startScan(listOf(filter), settings, scanCallback) }
-            .onFailure { scanning = false; onStatus("BLE: scan non avviato") }
+            .onSuccess { main.postDelayed(scanTimeout, SCAN_TIMEOUT_MS) }
+            .onFailure {
+                scanning = false
+                onStatus("BLE: scan non avviato")
+                retryLater(RETRY_MS)
+            }
     }
 
     @SuppressLint("MissingPermission")
     private fun stopScan() {
+        main.removeCallbacks(scanTimeout)
         if (!scanning) return
         scanning = false
         runCatching { scanner?.stopScan(scanCallback) }
@@ -111,7 +159,7 @@ class BleMirror(
         override fun onScanFailed(errorCode: Int) {
             scanning = false
             onStatus("BLE: scan fallito ($errorCode)")
-            retryLater()
+            retryLater(RETRY_MS)
         }
     }
 
@@ -132,7 +180,7 @@ class BleMirror(
         mtu = 23
     }
 
-    private fun retryLater(delayMs: Long = 2000) {
+    private fun retryLater(delayMs: Long = RECONNECT_MS) {
         if (!wantConnected) return
         main.postDelayed({ startScan() }, delayMs)
     }
@@ -176,8 +224,9 @@ class BleMirror(
         }
     }
 
-    /** Mette in coda il pacchetto e prova a inviarlo. */
+    /** Mette in coda il pacchetto e prova a inviarlo. Se il BLE non c'è, lo scarta. */
     fun send(payload: ByteArray) {
+        if (!wantConnected) return
         pending = payload
         flush()
     }

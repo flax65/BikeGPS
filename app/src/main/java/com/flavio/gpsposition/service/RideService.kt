@@ -78,15 +78,20 @@ class RideService : Service() {
         RideState.reset()
         RideState.running.value = true
         startForegroundCompat()
-        tracker.start()
-        ble.start()
+
+        // Il GPS è il cuore dell'app: parte sempre, indipendentemente dal BLE.
+        runCatching { tracker.start() }
+
+        // Il BLE è opzionale: un suo errore non deve fermare la registrazione.
+        runCatching { ble.start() }
+            .onFailure { RideState.bleStatus.value = "BLE: errore" }
     }
 
     private fun stopEverything() {
         if (!running) return
         running = false
-        tracker.stop()
-        ble.stop()
+        runCatching { tracker.stop() }
+        runCatching { ble.stop() }
         RideState.running.value = false
     }
 

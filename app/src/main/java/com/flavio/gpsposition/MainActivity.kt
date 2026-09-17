@@ -61,25 +61,42 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private fun requiredPermissions(): Array<String> {
-    val perms = mutableListOf(
-        Manifest.permission.ACCESS_FINE_LOCATION,
-        Manifest.permission.ACCESS_COARSE_LOCATION
-    )
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        perms += Manifest.permission.BLUETOOTH_SCAN
-        perms += Manifest.permission.BLUETOOTH_CONNECT
-    }
+/** Permessi necessari per registrare la posizione (indipendenti dal BLE). */
+private fun locationPermissions(): Array<String> = arrayOf(
+    Manifest.permission.ACCESS_FINE_LOCATION,
+    Manifest.permission.ACCESS_COARSE_LOCATION
+)
+
+/** Permessi chiesti all'avvio: posizione + notifica (best effort). */
+private fun startPermissions(): Array<String> {
+    val perms = locationPermissions().toMutableList()
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         perms += Manifest.permission.POST_NOTIFICATIONS
     }
     return perms.toTypedArray()
 }
 
-private fun hasAllPermissions(context: Context): Boolean =
-    requiredPermissions().all {
+/** Permessi BLE: opzionali, servono solo per il mirror sull'ESP32. */
+private fun bluetoothPermissions(): Array<String> =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        arrayOf(
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_CONNECT
+        )
+    } else {
+        emptyArray()
+    }
+
+private fun allGranted(context: Context, perms: Array<String>): Boolean =
+    perms.all {
         ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
     }
+
+private fun hasLocationPermissions(context: Context): Boolean =
+    allGranted(context, locationPermissions())
+
+private fun hasBluetoothPermissions(context: Context): Boolean =
+    allGranted(context, bluetoothPermissions())
 
 @Composable
 fun BikeScreen() {
@@ -90,13 +107,24 @@ fun BikeScreen() {
     val bleStatus by RideState.bleStatus.collectAsState()
     val running by RideState.running.collectAsState()
 
-    var permissionGranted by remember { mutableStateOf(hasAllPermissions(context)) }
+    var locationGranted by remember { mutableStateOf(hasLocationPermissions(context)) }
+    var bluetoothGranted by remember { mutableStateOf(hasBluetoothPermissions(context)) }
 
-    val permissionLauncher = rememberLauncherForActivityResult(
+    // Avvio: serve solo la posizione. Le notifiche sono best effort.
+    val startLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        permissionGranted = hasAllPermissions(context)
-        if (permissionGranted) RideService.start(context)
+        locationGranted = hasLocationPermissions(context)
+        bluetoothGranted = hasBluetoothPermissions(context)
+        if (locationGranted) RideService.start(context)
+    }
+
+    // Permessi BLE opzionali: il service è già avviato e BleMirror riproverà da solo
+    // appena i permessi vengono concessi (nessun riavvio necessario).
+    val bluetoothLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        bluetoothGranted = hasBluetoothPermissions(context)
     }
 
     Column(
@@ -158,15 +186,35 @@ fun BikeScreen() {
             }
         }
 
-        if (!permissionGranted) {
+        if (!locationGranted) {
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.error)
             ) {
                 Column(Modifier.padding(16.dp)) {
-                    Text("Servono i permessi (posizione, BLE, notifiche)", fontWeight = FontWeight.Bold)
+                    Text("Serve il permesso posizione per registrare", fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(8.dp))
-                    Button(onClick = { permissionLauncher.launch(requiredPermissions()) }) {
-                        Text("Concedi permessi")
+                    Button(onClick = { startLauncher.launch(startPermissions()) }) {
+                        Text("Concedi permessi posizione")
+                    }
+                }
+            }
+        } else if (!bluetoothGranted) {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("BLE non attivo (opzionale)", fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Il GPS registra comunque. Concedi i permessi BLE per il mirror sull'ESP32.",
+                        color = Muted,
+                        fontSize = 12.sp
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = { bluetoothLauncher.launch(bluetoothPermissions()) }) {
+                        Text("Concedi permessi BLE")
                     }
                 }
             }
@@ -177,8 +225,8 @@ fun BikeScreen() {
             Button(
                 modifier = Modifier.weight(1f),
                 onClick = {
-                    if (!hasAllPermissions(context)) {
-                        permissionLauncher.launch(requiredPermissions())
+                    if (!hasLocationPermissions(context)) {
+                        startLauncher.launch(startPermissions())
                     } else {
                         RideService.start(context)
                     }
