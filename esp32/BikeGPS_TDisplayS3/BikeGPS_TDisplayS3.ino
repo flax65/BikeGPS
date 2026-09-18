@@ -303,6 +303,22 @@ static uint16_t zoneCol[ZONE_COUNT];       // riempiti in setup()
 
 static float targetSpeed = 25.0f;          // km/h (pagina COST SPEED)
 static int   targetHr    = 150;            // bpm (pagina COST BPM)
+
+// target velocita': intervallo selezionabile e passo del tasto sinistro
+#define TGT_SPEED_MIN  25.0f
+#define TGT_SPEED_MAX  35.0f
+#define TGT_SPEED_STEP  1.0f
+
+// target battito
+#define TGT_HR_MIN  80
+#define TGT_HR_MAX  200
+
+// riporta il target velocita' nell'intervallo (con ritorno al minimo se si supera il massimo)
+static void clampTargetSpeed(bool wrap) {
+  if (wrap && targetSpeed > TGT_SPEED_MAX) targetSpeed = TGT_SPEED_MIN;
+  else if (targetSpeed < TGT_SPEED_MIN)     targetSpeed = TGT_SPEED_MIN;
+  else if (targetSpeed > TGT_SPEED_MAX)     targetSpeed = TGT_SPEED_MAX;
+}
 #define TOLL_SPEED 1.0f                    // tolleranza target velocita' (km/h)
 #define TOLL_HR    5                       // tolleranza target battito (bpm)
 #define DEV_RANGE_SPEED 5.0f               // fondo scala barra deviazione (km/h)
@@ -1074,6 +1090,9 @@ static void loadSettings() {
   targetHr    = prefs.getInt("tgtHr", targetHr);
   prefs.end();
   page = P_RIDE;                 // si parte sempre dalla pagina RIDE
+  clampTargetSpeed(false);
+  if (targetHr < TGT_HR_MIN) targetHr = TGT_HR_MIN;
+  if (targetHr > TGT_HR_MAX) targetHr = TGT_HR_MAX;
   for (int i = 1; i < N_ZLIM; i++) if (zoneLim[i] <= zoneLim[i - 1]) zoneLim[i] = zoneLim[i - 1] + 1;
 }
 
@@ -1105,13 +1124,13 @@ static void onSetShort() {
   bool changed = false;
   switch (page) {
     case P_COST_SPEED:
-      targetSpeed += 1.0f;
-      if (targetSpeed > 60.0f) targetSpeed = 5.0f;
+      targetSpeed += TGT_SPEED_STEP;
+      clampTargetSpeed(true);      // oltre 35 km/h riparte da 25
       changed = true;
       break;
     case P_COST_BPM:
       targetHr++;
-      if (targetHr > 200) targetHr = 80;
+      if (targetHr > TGT_HR_MAX) targetHr = TGT_HR_MIN;
       changed = true;
       break;
     case P_SETUP:
@@ -1140,6 +1159,7 @@ static void onSetLong() {
     case P_COST_SPEED:
       if (gpsLive() || tel.lastRx != 0) {
         targetSpeed = roundf(tel.spd * 10.0f) / 10.0f;
+        clampTargetSpeed(false);     // resta nell'intervallo 25..35
         saveSettings();
         invalidateCache();
         drawFull();
