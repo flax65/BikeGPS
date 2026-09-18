@@ -61,7 +61,7 @@
 TFT_eSPI tft = TFT_eSPI();
 
 // ---------------------------------------------------------------- colori (Tokyo Night)
-static uint16_t C_BG, C_PANEL, C_BORDER, C_FG, C_DIM, C_BLUE, C_GREEN, C_RED, C_YELLOW, C_CYAN;
+static uint16_t C_BG, C_PANEL, C_BORDER, C_FG, C_DIM, C_BLUE, C_GREEN, C_RED, C_YELLOW, C_CYAN, C_BATT;
 static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
   return tft.color565(r, g, b);
 }
@@ -222,6 +222,7 @@ static void hrConnectWorker(void *param) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     hrConnectResult = hrConnect() ? 1 : 0;
+    ulTaskNotifyTake(pdTRUE, 0);   // scarta eventuali richieste accodate nel frattempo
   }
 }
 
@@ -440,8 +441,9 @@ static void setupGeometry() {
 
 static bool gpsLive() { return bleConnected && tel.lastRx != 0 && (millis() - tel.lastRx <= 5000); }
 static bool hrLive()  { return tel.hrLastRx != 0 && (millis() - tel.hrLastRx <= 5000); }
-// "in acquisizione": sta cercando o si sta connettendo alla cintura
-static bool hrAcquiring() { return hrState == HR_SCANNING || hrState == HR_CONNECTING; }
+// "in acquisizione": la fascia e' stata trovata e ci si sta connettendo.
+// In scansione senza averla trovata NON e' acquisizione (nessuna fascia presente).
+static bool hrAcquiring() { return hrState == HR_CONNECTING || (hrState == HR_SCANNING && hrFound); }
 
 // Helper: testo con scelta automatica del font in base alla larghezza utile
 static void drawFitted(int x, int y, int w, const char *s, uint16_t fg, uint16_t bg) {
@@ -507,7 +509,7 @@ static void drawBatteryIcon(int x, int y, int pct) {
   int filled = (pct + 12) / 25;                       // 0..4 segmenti
   if (filled > 4) filled = 4;
   if (filled < 0) filled = 0;
-  uint16_t col = (pct < 20) ? C_RED : (pct < 40 ? C_YELLOW : C_GREEN);
+  uint16_t col = (pct < 20) ? C_RED : (pct < 40 ? C_YELLOW : C_BATT);
   for (int i = 0; i < 4; i++)
     tft.fillRect(x + 2 + i * 6, y + 2, 4, h - 4, (i < filled) ? col : C_BG);
 }
@@ -528,14 +530,12 @@ static void drawHeartIcon(int x, int y, uint16_t col) {       // cuore
   tft.fillTriangle(x, y + 5, x + 11, y + 5, x + 6, y + 12, col);
 }
 
-// parte variabile dell'intestazione: GPS, BLE, cuore, batteria (solo se cambiano)
+// parte variabile dell'intestazione: GPS, BLE, cuore, batteria (1 Hz, solo se cambiano)
 static void updateHeader() {
   const int pct    = battPercent();
   const bool gpsOn = gpsLive();
   const bool bleOn = bleConnected;
-  // cuore: 0 grigio (offline), 1 verde (legge), 2/3 rosso lampeggiante (acquisizione)
-  const int hrIdx  = hrLive() ? 1 : (hrAcquiring() ? (2 + (hrBlinkOn ? 1 : 0)) : 0);
-  const int state  = (bleOn ? 1 : 0) | (gpsOn ? 2 : 0) | (hrIdx << 2);
+  const int state  = (bleOn ? 1 : 0) | (gpsOn ? 2 : 0) | (hrLive() ? 4 : 0) | (hrAcquiring() ? 8 : 0);
   if (state == lastHeaderState && pct == lastBattPct) return;
 
   tft.fillRect(0, 0, 70, HDR_H, C_BG);          // pulizia area GPS/BLE/cuore
@@ -543,7 +543,7 @@ static void updateHeader() {
   tft.setTextColor(gpsOn ? C_BLUE : C_DIM, C_BG);
   tft.drawString("GPS", 4, (HDR_H - 16) / 2, 2);
   drawBleIcon(34, (HDR_H - 12) / 2, bleOn ? C_BLUE : C_DIM);
-  drawHeartIcon(54, (HDR_H - 12) / 2, hrLive() ? C_GREEN : (hrAcquiring() ? (hrBlinkOn ? C_RED : C_DIM) : C_DIM));
+  drawHeartIcon(54, (HDR_H - 12) / 2, hrLive() ? C_GREEN : (hrAcquiring() ? C_RED : C_DIM));
   drawBatteryIcon(W - 36, (HDR_H - 13) / 2, pct);
 
   lastHeaderState = state;
@@ -1161,7 +1161,6 @@ static void drawFull() {
 static void drawValues() {
   const char *vals[8];
   uint16_t cols[8];
-  updateHeader();
   switch (page) {
     case P_RIDE:
       updateRide();
@@ -1473,6 +1472,7 @@ void setup() {
   C_DIM    = rgb(0x56, 0x5f, 0x89);
   C_BLUE   = rgb(0x7a, 0xa2, 0xf7);
   C_GREEN  = rgb(0x9e, 0xce, 0x6a);
+  C_BATT   = rgb(0x55, 0x90, 0x3a);   // verde piu' scuro, solo per la batteria
   C_RED    = rgb(0xf7, 0x76, 0x8e);
   C_YELLOW = rgb(0xe0, 0xaf, 0x68);
   C_CYAN   = rgb(0x7d, 0xcf, 0xff);
@@ -1551,8 +1551,16 @@ static void taskTargetTime() {              // 1 Hz: secondi passati nel target
 }
 
 static void taskDisplay() {                 // 4 Hz: ridisegna solo i valori cambiati (cache)
-  hrBlinkOn = !hrBlinkOn;                   // lampeggio del cuore in acquisizione (2 Hz)
   if (!freezeDraw) drawValues();
+}
+
+static void taskHeader() { updateHeader(); }          // 1 Hz: GPS, BLE, batteria
+
+// 2 Hz: alterna il cuore in acquisizione (1 Hz acceso/spento)
+static void taskBlink() {
+  hrBlinkOn = !hrBlinkOn;
+  if (hrAcquiring() && !hrLive())
+    drawHeartIcon(54, (HDR_H - 12) / 2, hrBlinkOn ? C_RED : C_DIM);
 }
 
 static void taskSaveSettings() {            // 1 Hz: salva in flash solo se serve
@@ -1716,13 +1724,12 @@ static void taskSerial() {
       schedMaxJitter = 0;
     }
     else if (c == 'c') {
-      // test: forza un handshake BLE (indirizzo inesistente -> fallisce dopo il timeout)
-      // per verificare che il loop NON si blocchi mentre il worker connette.
+      // test: simula una fascia trovata a un indirizzo inesistente. La richiesta
+      // la inoltra la macchina a stati (HR_SCANNING), mai direttamente.
       hrAddress = NimBLEAddress(std::string("DE:AD:BE:EF:00:01"), BLE_ADDR_PUBLIC);
-      hrConnectResult = -1;
-      xTaskNotifyGive(hrConnectHandle);
-      hrState = HR_CONNECTING;          // mostra il cuore rosso lampeggiante (acquisizione)
-      Serial.println("test connect: richiesta al worker (core 0)");
+      hrFound = true;
+      hrState = HR_SCANNING;
+      Serial.println("test connect: fascia finta trovata");
     }
     else if (c == 'd') {
       printStatus();
@@ -1746,6 +1753,8 @@ static TaskDef sched[] = {
   {"hr",         50, 0, hrTask},
   {"serial",     20, 0, taskSerial},
   {"display",   250, 0, taskDisplay},
+  {"blink",     500, 0, taskBlink},
+  {"header",   1000, 0, taskHeader},
   {"nvs",      1000, 0, taskSaveSettings},
   {"battery",  1000, 0, taskBattery},
   {"target",   1000, 0, taskTargetTime},
