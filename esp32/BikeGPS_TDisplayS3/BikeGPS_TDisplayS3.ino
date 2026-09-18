@@ -56,12 +56,17 @@
 #define SERIAL_DEBUG 1
 
 #define ROTATION 0          // 0/2 = verticale, 1/3 = orizzontale (cambia il verso)
+
+// Rendering della velocita' nel riquadro RIDE:
+//   0 = font bitmap di TFT_eSPI (bello, ma dimensione fissa)
+//   1 = 7 segmenti vettoriale (scalabile, ma estetica "a rettangoli")
+#define HERO_RENDER_SEG 0
 #define HDR_H 26            // altezza della riga di stato in alto
 
 TFT_eSPI tft = TFT_eSPI();
 
 // ---------------------------------------------------------------- colori (Tokyo Night)
-static uint16_t C_BG, C_PANEL, C_BORDER, C_FG, C_DIM, C_BLUE, C_GREEN, C_RED, C_YELLOW, C_CYAN, C_BATT;
+static uint16_t C_BG, C_PANEL, C_BORDER, C_FG, C_DIM, C_BLUE, C_GREEN, C_RED, C_YELLOW, C_CYAN, C_BATT, C_SEG_EDGE;
 static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
   return tft.color565(r, g, b);
 }
@@ -341,7 +346,6 @@ static int battPercent() {
 enum Page { P_RIDE, P_COST_SPEED, P_COST_BPM, P_SETUP, P_DIAG, PAGE_COUNT };
 static uint8_t page = P_RIDE;
 static bool backlightOn = true;
-static bool freezeDraw = false;   // usato dal test 'r'/'v'/'k' per non sovrascrivere il colore
 static uint32_t bootTime = 0;     // usato per ignorare i tasti nei primi istanti dopo il boot
 
 // Pagina successiva/precedente. La SETUP (soglie cardio) non fa parte del giro:
@@ -398,6 +402,14 @@ static bool lastHeroLive = false;
 static int  lastHeaderState = -1;  // BLE + GPS + stato colore cuore (-1 = da disegnare)
 static int  lastBattPct = -1;      // percentuale batteria disegnata (segmenti)
 static bool hrBlinkOn = false;     // lampeggio del cuore in acquisizione
+
+// velocita' a 7 segmenti vettoriale (scalabile al riquadro)
+static float heroSegUnits = 0;     // unita' di larghezza per cui e' tarata la geometria
+static int   heroSegLen = -1;      // numero di caratteri disegnati
+static bool  heroSegLive = true;   // colore usato nell'ultimo disegno
+static uint8_t heroSegDrawn[8];    // maschera segmenti disegnata per posizione
+static bool    heroSegInit[8];     // posizione gia' disegnata (per la sagoma dei segmenti spenti)
+static int segW, segH, segT, segGap, segY;
 // cache delle pagine di allenamento
 static char lastTgt[24], lastHeroC[24], lastDev[24], lastInfo[40], lastTime[24];
 static uint16_t lastHeroCCol = 0;   // colore dell'hero (cambia senza che cambi il testo)
@@ -413,6 +425,9 @@ static void invalidateCache() {
   lastHeroLive = false;
   lastHeaderState = -1;
   lastBattPct = -1;
+  heroSegLen = -1;
+  memset(heroSegDrawn, 0, sizeof(heroSegDrawn));
+  memset(heroSegInit, 0, sizeof(heroSegInit));
   lastTgt[0] = lastHeroC[0] = lastDev[0] = lastInfo[0] = lastTime[0] = 0;
   lastHeroCCol = 0;
   lastZoneShown = -9;
@@ -511,6 +526,157 @@ static void drawFittedCached(int i, int x, int y, int w, const char *s, uint16_t
   lastVals[i][sizeof(lastVals[i]) - 1] = 0;
   lastValsCol[i] = fg;
 }
+
+// ------------------------------------------------ velocita' 7 segmenti vettoriale
+// Ogni cifra e' fatta di 7 segmenti disegnati come rettangoli: la dimensione si
+// calcola dal riquadro (heroW x heroH), quindi la velocita' lo riempie davvero.
+// Cache per posizione: si ridisegnano solo i segmenti che cambiano.
+#define SEG_A 0x01
+#define SEG_B 0x02
+#define SEG_C 0x04
+#define SEG_D 0x08
+#define SEG_E 0x10
+#define SEG_F 0x20
+#define SEG_G 0x40
+#define SEG_DOT 0x80
+
+static const uint8_t SEG_DIGITS[10] = {
+  SEG_A|SEG_B|SEG_C|SEG_D|SEG_E|SEG_F,              // 0
+  SEG_B|SEG_C,                                      // 1
+  SEG_A|SEG_B|SEG_G|SEG_E|SEG_D,                    // 2
+  SEG_A|SEG_B|SEG_G|SEG_C|SEG_D,                    // 3
+  SEG_F|SEG_G|SEG_B|SEG_C,                          // 4
+  SEG_A|SEG_F|SEG_G|SEG_C|SEG_D,                    // 5
+  SEG_A|SEG_F|SEG_G|SEG_E|SEG_C|SEG_D,              // 6
+  SEG_A|SEG_B|SEG_C,                                // 7
+  SEG_A|SEG_B|SEG_C|SEG_D|SEG_E|SEG_F|SEG_G,        // 8
+  SEG_A|SEG_B|SEG_C|SEG_D|SEG_F|SEG_G,              // 9
+};
+
+// --- da qui in poi: rendering 7 segmenti (usato solo se HERO_RENDER_SEG == 1) ---
+#if HERO_RENDER_SEG
+
+static uint8_t segMask(char c) {
+  if (c >= '0' && c <= '9') return SEG_DIGITS[c - '0'];
+  if (c == '-') return SEG_G;
+  if (c == '.') return SEG_DOT;
+  return 0;
+}
+
+// larghezza della stringa in "unita'": cifre 1.0, punto 0.30, spazio 0.06
+static float heroUnits(const char *s) {
+  float u = 0;
+  for (int i = 0; s[i]; i++) {
+    if (i) u += 0.06f;
+    u += (s[i] == '.') ? 0.30f : 1.0f;
+  }
+  return u;
+}
+
+static void heroSegLayout(float units) {
+  const int MX = 10, MY = 10;
+  int availW = heroW - 2 * MX, availH = heroH - 2 * MY;
+  float h = (availW / units) / 0.58f;    // larghezza cifra = 0.58 * altezza
+  if (h > availH) h = availH;            // vincolo verticale
+  segH = (int)h;
+  segW = (int)(segH * 0.58f);
+  segT = segH / 8; if (segT < 3) segT = 3;
+  segGap = segW / 12; if (segGap < 2) segGap = 2;
+  segY = heroY + (heroH - segH) / 2;
+}
+
+static void heroClear() {
+  tft.fillRect(heroX + 1, segY - 2, heroW - 2, segH + 4, C_PANEL);
+  memset(heroSegDrawn, 0, sizeof(heroSegDrawn));
+  memset(heroSegInit, 0, sizeof(heroSegInit));
+}
+
+// --- segmenti come trapezi: riempimento di un colore + bordo di un altro
+static void segTrapH(int x, int y, int w, int t, uint16_t fill, uint16_t edge) {
+  int p = t / 2; if (p < 1) p = 1;
+  tft.fillTriangle(x, y, x + w, y, x + p, y + t, fill);
+  tft.fillTriangle(x + w, y, x + w - p, y + t, x + p, y + t, fill);
+  tft.drawLine(x, y, x + w, y, edge);
+  tft.drawLine(x + w, y, x + w - p, y + t, edge);
+  tft.drawLine(x + w - p, y + t, x + p, y + t, edge);
+  tft.drawLine(x + p, y + t, x, y, edge);
+}
+
+// verticale con base esterna a sinistra (segmenti F, E)
+static void segTrapV(int x, int y, int h, int t, uint16_t fill, uint16_t edge) {
+  int p = t / 2; if (p < 1) p = 1;
+  tft.fillTriangle(x, y, x + t, y + p, x, y + h, fill);
+  tft.fillTriangle(x + t, y + p, x + t, y + h - p, x, y + h, fill);
+  tft.drawLine(x, y, x + t, y + p, edge);
+  tft.drawLine(x + t, y + p, x + t, y + h - p, edge);
+  tft.drawLine(x + t, y + h - p, x, y + h, edge);
+  tft.drawLine(x, y + h, x, y, edge);
+}
+
+// verticale con base esterna a destra (segmenti B, C)
+static void segTrapVR(int x, int y, int h, int t, uint16_t fill, uint16_t edge) {
+  int p = t / 2; if (p < 1) p = 1;
+  tft.fillTriangle(x, y + p, x + t, y, x + t, y + h, fill);
+  tft.fillTriangle(x, y + p, x + t, y + h, x, y + h - p, fill);
+  tft.drawLine(x, y + p, x + t, y, edge);
+  tft.drawLine(x + t, y, x + t, y + h, edge);
+  tft.drawLine(x + t, y + h, x, y + h - p, edge);
+  tft.drawLine(x, y + h - p, x, y + p, edge);
+}
+
+// disegna UN segmento (bit) di una cifra: acceso colorato, spento come sagoma scura
+static void drawSeg7(int x, int y, int w, int h, int t, uint8_t bit, bool on, uint16_t colOn) {
+  const uint16_t fill = on ? colOn : C_PANEL;
+  const uint16_t edge = on ? C_SEG_EDGE : C_BORDER;
+  const int hh = h / 2;
+  const int hlen = hh - t;
+  switch (bit) {
+    case SEG_A: segTrapH(x + t / 2, y, w - t, t, fill, edge); break;
+    case SEG_G: segTrapH(x + t / 2, y + hh - t / 2, w - t, t, fill, edge); break;
+    case SEG_D: segTrapH(x + t / 2, y + h - t, w - t, t, fill, edge); break;
+    case SEG_F: segTrapV(x, y + t / 2, hlen, t, fill, edge); break;
+    case SEG_B: segTrapVR(x + w - t, y + t / 2, hlen, t, fill, edge); break;
+    case SEG_E: segTrapV(x, y + hh + t / 2, hlen, t, fill, edge); break;
+    case SEG_C: segTrapVR(x + w - t, y + hh + t / 2, hlen, t, fill, edge); break;
+    case SEG_DOT:
+      tft.fillRect(x + 1, y + h - t, t, t, fill);
+      tft.drawRect(x + 1, y + h - t, t, t, edge);
+      break;
+  }
+}
+
+static void drawHeroValue(const char *s, bool live) {
+  const int n = (int)strlen(s);
+  float uRef = 3.48f;                    // "88.8": dimensione di riferimento stabile
+  float u = heroUnits(s);
+  if (u > uRef) uRef = u;                // se serve piu' spazio, si adatta
+  if (uRef != heroSegUnits) { heroSegLayout(uRef); heroSegUnits = uRef; heroSegLen = -1; }
+  if (n != heroSegLen || live != heroSegLive) { heroClear(); heroSegLen = n; heroSegLive = live; }
+
+  const uint16_t col = live ? C_FG : C_DIM;
+  int total = 0;
+  for (int i = 0; i < n; i++) {
+    total += (s[i] == '.') ? (int)(segW * 0.30f) : segW;
+    if (i) total += segGap;
+  }
+  int x = heroX + (heroW - total) / 2;
+  for (int i = 0; i < n; i++) {
+    const int cw = (s[i] == '.') ? (int)(segW * 0.30f) : segW;
+    const uint8_t mask = segMask(s[i]);
+    if (!heroSegInit[i] || mask != heroSegDrawn[i]) {
+      const uint8_t diff = heroSegInit[i] ? (uint8_t)(mask ^ heroSegDrawn[i]) : 0xFF;
+      for (int b = 0; b < 8; b++) {
+        const uint8_t bit = (uint8_t)(1 << b);
+        if (diff & bit) drawSeg7(x, segY, cw, segH, segT, bit, (mask & bit) != 0, col);
+      }
+      heroSegDrawn[i] = mask;
+      heroSegInit[i] = true;
+    }
+    x += cw + segGap;
+  }
+}
+
+#endif  // HERO_RENDER_SEG
 
 static void drawCell(int x, int y, int w, int h, const char *label, const char *value, uint16_t vc) {
   tft.fillRoundRect(x, y, w, h, 6, C_PANEL);
@@ -645,7 +811,10 @@ static void updateRide() {
   if (live) snprintf(v, sizeof(v), "%.1f", tel.spd);
   else      snprintf(v, sizeof(v), "-.-");
   if (strcmp(v, lastHeroVal) != 0 || live != lastHeroLive) {
-    // velocita' gigante centrata in tutto il box
+#if HERO_RENDER_SEG
+    drawHeroValue(v, live);
+#else
+    // font 7 segmenti bitmap di TFT_eSPI (FONT7), centrato nel riquadro
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(live ? C_FG : C_DIM, C_PANEL);
     tft.setTextPadding(heroW - 12);   // cancella solo l'area del testo (anti-flicker)
@@ -653,6 +822,7 @@ static void updateRide() {
     tft.setTextPadding(0);
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(C_DIM, C_PANEL);
+#endif
     strncpy(lastHeroVal, v, sizeof(lastHeroVal) - 1);
     lastHeroVal[sizeof(lastHeroVal) - 1] = 0;
     lastHeroLive = live;
@@ -1517,6 +1687,7 @@ void setup() {
   C_BLUE   = rgb(0x7a, 0xa2, 0xf7);
   C_GREEN  = rgb(0x9e, 0xce, 0x6a);
   C_BATT   = rgb(0x55, 0x90, 0x3a);   // verde piu' scuro, solo per la batteria
+  C_SEG_EDGE = rgb(0x0d, 0x0f, 0x17); // bordo dei segmenti accesi (effetto display)
   C_RED    = rgb(0xf7, 0x76, 0x8e);
   C_YELLOW = rgb(0xe0, 0xaf, 0x68);
   C_CYAN   = rgb(0x7d, 0xcf, 0xff);
@@ -1592,7 +1763,7 @@ static void taskTargetTime() {              // 1 Hz: secondi passati nel target
 }
 
 static void taskDisplay() {                 // 4 Hz: ridisegna solo i valori cambiati (cache)
-  if (!freezeDraw) drawValues();
+  drawValues();
 }
 
 static void taskHeader() { updateHeader(); }          // 1 Hz: GPS, BLE, batteria
@@ -1617,10 +1788,8 @@ static void taskSerial() {
   if (Serial.available()) {
     int c = Serial.read();
     if (c == 'n') {
-      freezeDraw = false;
       onPageShort();
     } else if (c == 'p') {
-      freezeDraw = false;
       onPagePrev();
     } else if (c == 'b') setBacklight(!backlightOn);
     else if (c == 's') printStatus();
@@ -1651,7 +1820,6 @@ static void taskSerial() {
     } else if (c == 'r' || c == 'v' || c == 'k') {
       // test diretto sul pannello, senza passare dallo sprite
       uint16_t col = (c == 'r') ? TFT_RED : (c == 'v') ? TFT_GREEN : TFT_BLACK;
-      freezeDraw = true;
       tft.fillScreen(col);
 #if SERIAL_DEBUG
       Serial.printf("test pannello: fillScreen(0x%04X) colore=%c\n", col, c);
@@ -1709,6 +1877,7 @@ static void taskSerial() {
         t0 = micros(); drawValues(); misura("warm (nessun cambio)");
         if (page == P_RIDE) {
           lastHeroVal[0] = 0;
+          heroSegLen = -1;              // caso peggiore: ridisegna tutta la velocita'
           t0 = micros(); drawValues(); misura("hero velocita");
         }
         if (page == P_RIDE || page == P_DIAG) {
@@ -1764,6 +1933,16 @@ static void taskSerial() {
                     (unsigned long)schedRuns, (unsigned long)schedMaxJitter, (int)hrConnectResult);
       schedMaxJitter = 0;
     }
+    else if (c == 'f') {
+      // larghezze reali dei font: serve a sapere quali stringhe entrano nel riquadro
+      Serial.printf("hero: heroW=%d utile=%d\n", heroW, heroW - 16);
+      const char *tests[] = {"25.4", "30.5", "55.5", "99.9", "100.0", "-.-  "};
+      for (unsigned i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
+        Serial.printf("  '%s': f8=%d f7=%d\n", tests[i],
+                      tft.textWidth(tests[i], 8), tft.textWidth(tests[i], 7));
+      Serial.printf("seg: w=%d h=%d t=%d gap=%d y=%d | box %dx%d @%d,%d | units=%.2f\n",
+                    segW, segH, segT, segGap, segY, heroW, heroH, heroX, heroY, heroSegUnits);
+    }
     else if (c == 'h') {
       // diagnostica cardio: stato della macchina, client, ultimo battito
       Serial.printf("hr: state=%d found=%d client=%p result=%d bpm=%d eta=%lums live=%d acq=%d scan=%d\n",
@@ -1786,7 +1965,6 @@ static void taskSerial() {
       tft.init();                       // re-init del pannello
       tft.setRotation(ROTATION);
       setBacklight(true);
-      freezeDraw = false;
       drawFull();
       printStatus();
     }
