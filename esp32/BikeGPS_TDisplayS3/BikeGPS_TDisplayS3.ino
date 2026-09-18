@@ -51,6 +51,8 @@
 #define HDR_H 26            // altezza della riga di stato in alto
 
 TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite spr = TFT_eSprite(&tft);   // buffer di disegno: si disegna offline e poi un solo push
+                                       // -> nessun flicker sulle cifre grandi
 
 // ---------------------------------------------------------------- colori (Tokyo Night)
 static uint16_t C_BG, C_PANEL, C_BORDER, C_FG, C_DIM, C_BLUE, C_GREEN, C_RED, C_YELLOW, C_CYAN;
@@ -337,39 +339,39 @@ static bool hrLive()  { return tel.hrLastRx != 0 && (millis() - tel.hrLastRx <= 
 // Helper: testo con scelta automatica del font in base alla larghezza utile
 static void drawFitted(int x, int y, int w, const char *s, uint16_t fg, uint16_t bg) {
   uint8_t f = 4;
-  if (tft.textWidth(s, 4) > w - 16) f = 2;
-  if (tft.textWidth(s, 2) > w - 16) f = 1;
-  tft.setTextColor(fg, bg);
-  tft.setTextFont(f);
-  tft.drawString(s, x, y, f);
-  tft.setTextFont(2);
+  if (spr.textWidth(s, 4) > w - 16) f = 2;
+  if (spr.textWidth(s, 2) > w - 16) f = 1;
+  spr.setTextColor(fg, bg);
+  spr.setTextFont(f);
+  spr.drawString(s, x, y, f);
+  spr.setTextFont(2);
 }
 
 static void drawCell(int x, int y, int w, int h, const char *label, const char *value, uint16_t vc) {
-  tft.fillRoundRect(x, y, w, h, 6, C_PANEL);
-  tft.drawRoundRect(x, y, w, h, 6, C_BORDER);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(C_DIM, C_PANEL);
-  tft.drawString(label, x + 8, y + 6, 2);
-  tft.setTextDatum(ML_DATUM);
+  spr.fillRoundRect(x, y, w, h, 6, C_PANEL);
+  spr.drawRoundRect(x, y, w, h, 6, C_BORDER);
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextColor(C_DIM, C_PANEL);
+  spr.drawString(label, x + 8, y + 6, 2);
+  spr.setTextDatum(ML_DATUM);
   drawFitted(x + 8, y + h - 16, w, value, vc, C_PANEL);
-  tft.setTextDatum(TL_DATUM);
+  spr.setTextDatum(TL_DATUM);
 }
 
 // riga di stato in alto: titolo a sinistra, BLE + batteria a destra
 static void drawHeader() {
-  tft.fillRect(0, 0, tft.width(), HDR_H, C_BG);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(C_BLUE, C_BG);
-  tft.drawString("BikeGPS", 6, 5, 2);
+  spr.fillRect(0, 0, spr.width(), HDR_H, C_BG);
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextColor(C_BLUE, C_BG);
+  spr.drawString("BikeGPS", 6, 5, 2);
 
   char st[32];
   const char *ble = bleConnected ? "BLE" : "no BLE";
   snprintf(st, sizeof(st), "%s  %d%%", ble, battPercent());
-  tft.setTextDatum(TR_DATUM);
-  tft.setTextColor(bleConnected ? C_GREEN : C_RED, C_BG);
-  tft.drawString(st, tft.width() - 6, 5, 2);
-  tft.setTextDatum(TL_DATUM);
+  spr.setTextDatum(TR_DATUM);
+  spr.setTextColor(bleConnected ? C_GREEN : C_RED, C_BG);
+  spr.drawString(st, spr.width() - 6, 5, 2);
+  spr.setTextDatum(TL_DATUM);
 }
 
 // --- formattazioni condivise
@@ -394,12 +396,12 @@ static const char *const SYS_LABELS[6]   = {"BLE", "CARDIO bpm", "SATELLITI", "B
 // ---------------------------------------------------------------- pagina RIDE
 static void layoutRide() {
   // pannello velocita' + etichetta unita'
-  tft.fillRoundRect(heroX, heroY, heroW, heroH, 6, C_PANEL);
-  tft.drawRoundRect(heroX, heroY, heroW, heroH, 6, C_BORDER);
-  tft.setTextDatum(BR_DATUM);
-  tft.setTextColor(C_DIM, C_PANEL);
-  tft.drawString("km/h", heroX + heroW - 8, heroY + heroH - 6, 2);
-  tft.setTextDatum(TL_DATUM);
+  spr.fillRoundRect(heroX, heroY, heroW, heroH, 6, C_PANEL);
+  spr.drawRoundRect(heroX, heroY, heroW, heroH, 6, C_BORDER);
+  spr.setTextDatum(BR_DATUM);
+  spr.setTextColor(C_DIM, C_PANEL);
+  spr.drawString("km/h", heroX + heroW - 8, heroY + heroH - 6, 2);
+  spr.setTextDatum(TL_DATUM);
 
   if (portrait) {
     // verticale: sotto l'hero la griglia 2x2 con distanza, tempo, media, max
@@ -423,16 +425,16 @@ static void updateRide() {
   bool live = gpsLive() || hrLive() || tel.lastRx != 0;
 
   // velocita' gigante (font 7 = "7 segment" 48 px)
-  tft.fillRect(heroX + 3, heroY + 3, heroW - 6, heroH - 26, C_PANEL);
+  spr.fillRect(heroX + 3, heroY + 3, heroW - 6, heroH - 26, C_PANEL);
   if (live) snprintf(v, sizeof(v), "%.1f", tel.spd);
   else      snprintf(v, sizeof(v), "-.-");
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(live ? C_FG : C_DIM, C_PANEL);
-  tft.drawString(v, heroX + heroW / 2, heroY + heroH / 2 - 8, 7);
-  tft.setTextDatum(TL_DATUM);
-  tft.drawFastHLine(heroX + 8, heroY + heroH - 24, heroW - 16, C_BORDER);
-  tft.setTextColor(C_DIM, C_PANEL);
-  tft.drawString(live ? "" : "no GPS", heroX + 8, heroY + heroH - 20, 2);
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextColor(live ? C_FG : C_DIM, C_PANEL);
+  spr.drawString(v, heroX + heroW / 2, heroY + heroH / 2 - 8, 7);
+  spr.setTextDatum(TL_DATUM);
+  spr.drawFastHLine(heroX + 8, heroY + heroH - 24, heroW - 16, C_BORDER);
+  spr.setTextColor(C_DIM, C_PANEL);
+  spr.drawString(live ? "" : "no GPS", heroX + 8, heroY + heroH - 20, 2);
 
   const char *vals[6];
   uint16_t cols[6];
@@ -448,7 +450,7 @@ static void updateRide() {
   const int gx = heroX + heroW + 4, gw = W - gx - 4;
   const int cy = heroY + heroH + 4, ch = H - cy - 4;
   const int cw = (heroW - 4) / 2;
-  tft.setTextDatum(ML_DATUM);
+  spr.setTextDatum(ML_DATUM);
   if (live) snprintf(v, sizeof(v), "%.2f", tel.dst); else strcpy(v, "--");
   drawFitted(heroX + 8, cy + ch - 16, cw, v, C_CYAN, C_PANEL);
   if (live) fmtTime(tel.mov, v, sizeof(v)); else strcpy(v, "--");
@@ -457,7 +459,7 @@ static void updateRide() {
   drawFitted(gx + 8, heroY + (heroH - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
   if (live) snprintf(v, sizeof(v), "%.1f", tel.mx); else strcpy(v, "--");
   drawFitted(gx + 8, heroY + (heroH - 4) / 2 + 4 + (heroH - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
-  tft.setTextDatum(TL_DATUM);
+  spr.setTextDatum(TL_DATUM);
 }
 
 // ---------------------------------------------------------------- pagine a griglia
@@ -476,13 +478,13 @@ static void layoutGrid(const char *const labels[6], int n) {
 
 static void updateGrid(const char *const labels[6], const char *const vals[6], const uint16_t cols[6], int n) {
   (void)labels;
-  tft.setTextDatum(ML_DATUM);
+  spr.setTextDatum(ML_DATUM);
   for (int i = 0; i < n; i++) {
     int x, y;
     gridCell(i, x, y);
     drawFitted(x + 8, y + gH - 16, gW, vals[i], cols[i], C_PANEL);
   }
-  tft.setTextDatum(TL_DATUM);
+  spr.setTextDatum(TL_DATUM);
 }
 
 static void statsValues(const char *vals[6], uint16_t cols[6]) {
@@ -521,7 +523,7 @@ static void sysValues(const char *vals[6], uint16_t cols[6]) {
 static void drawFull() {
   const char *vals[6];
   uint16_t cols[6];
-  tft.fillScreen(C_BG);
+  spr.fillScreen(C_BG);
   drawHeader();
   switch (page) {
     case P_RIDE:
@@ -542,11 +544,13 @@ static void drawFull() {
       updateGrid(SYS_LABELS, vals, cols, 6);
       break;
   }
+  spr.pushSprite(0, 0);
 }
 
 static void drawValues() {
   const char *vals[6];
   uint16_t cols[6];
+  drawHeader();
   switch (page) {
     case P_RIDE:
       updateRide();
@@ -563,6 +567,7 @@ static void drawValues() {
       updateGrid(SYS_LABELS, vals, cols, 6);
       break;
   }
+  spr.pushSprite(0, 0);
 }
 
 // ---------------------------------------------------------------- pulsanti
@@ -578,7 +583,13 @@ static void setBacklight(bool on) {
 static void handleButtons() {
   // BTN1: corto = pagina avanti, lungo = retroilluminazione
   bool n1 = digitalRead(btn1.pin);
-  if (n1 == LOW && btn1.last == HIGH) { btn1.tDown = millis(); btn1.longFired = false; }
+  if (n1 == LOW && btn1.last == HIGH) {
+    btn1.tDown = millis();
+    btn1.longFired = false;
+#if SERIAL_DEBUG
+    Serial.println("btn1 premuto");
+#endif
+  }
   if (n1 == LOW && !btn1.longFired && millis() - btn1.tDown > 800) {
     btn1.longFired = true;
     setBacklight(!backlightOn);
@@ -586,6 +597,9 @@ static void handleButtons() {
   if (n1 == HIGH && btn1.last == LOW) {
     if (!btn1.longFired && millis() - btn1.tDown > 30) {
       page = (page + 1) % pageCount;
+#if SERIAL_DEBUG
+      Serial.printf("pagina -> %d/%d\n", page + 1, pageCount);
+#endif
       drawFull();
     }
   }
@@ -593,9 +607,17 @@ static void handleButtons() {
 
   // BTN2: pagina indietro
   bool n2 = digitalRead(btn2.pin);
-  if (n2 == LOW && btn2.last == HIGH) { btn2.tDown = millis(); }
+  if (n2 == LOW && btn2.last == HIGH) {
+    btn2.tDown = millis();
+#if SERIAL_DEBUG
+    Serial.println("btn2 premuto");
+#endif
+  }
   if (n2 == HIGH && btn2.last == LOW && millis() - btn2.tDown > 30) {
     page = (page + pageCount - 1) % pageCount;
+#if SERIAL_DEBUG
+    Serial.printf("pagina -> %d/%d\n", page + 1, pageCount);
+#endif
     drawFull();
   }
   btn2.last = n2;
@@ -623,6 +645,13 @@ void setup() {
   tft.setRotation(ROTATION);
   setupGeometry();
   setBacklight(true);
+
+  // buffer di disegno (prima del BLE: cosi' l'allocazione ha tutta la RAM libera)
+  if (spr.createSprite(W, H) == nullptr) {
+#if SERIAL_DEBUG
+    Serial.println("ERRORE: sprite non allocato, disegno diretto (flicker)");
+#endif
+  }
 
   C_BG     = rgb(0x16, 0x17, 0x20);
   C_PANEL  = rgb(0x1f, 0x23, 0x35);
@@ -691,7 +720,14 @@ void loop() {
   if (millis() - lastDraw >= 250) {
     lastDraw = millis();
     drawValues();
-    drawHeader();
+  }
+
+  // comandi di test da seriale: n = pagina avanti, p = indietro, b = retroilluminazione
+  if (Serial.available()) {
+    int c = Serial.read();
+    if (c == 'n') { page = (page + 1) % pageCount; drawFull(); }
+    else if (c == 'p') { page = (page + pageCount - 1) % pageCount; drawFull(); }
+    else if (c == 'b') setBacklight(!backlightOn);
   }
   delay(5);
 }
