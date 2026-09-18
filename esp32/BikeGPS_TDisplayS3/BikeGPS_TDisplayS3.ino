@@ -154,6 +154,11 @@ static NimBLEAddress hrAddress;
 static volatile bool hrFound = false;
 static uint32_t hrNextTry = 0;
 
+// connect()+subscribe() sono sincroni e bloccanti: li esegue un task dedicato sul core 0,
+// cosi' il loop (core 1) non si ferma mai durante l'handshake BLE.
+static TaskHandle_t hrConnectHandle = nullptr;
+static volatile int8_t hrConnectResult = -1;   // <0 in corso, 0 fallita, 1 riuscita
+
 static void parseHeartRate(const uint8_t *d, size_t n) {
   if (n < 2) return;
   uint8_t flags = d[0];
@@ -208,10 +213,16 @@ static bool hrConnect() {
 
   // Intervallo lungo (~1 s): la Geonaute lo pretende, Android non glielo concede.
   hrClient->updateConnParams(800, 800, 0, 600);
-#if SERIAL_DEBUG
-  Serial.println("cardio pronto");
-#endif
   return true;
+}
+
+// Connessione fuori dal loop: attende la richiesta, connette, pubblica l'esito.
+static void hrConnectWorker(void *param) {
+  (void)param;
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    hrConnectResult = hrConnect() ? 1 : 0;
+  }
 }
 
 static void hrTask() {
@@ -232,14 +243,20 @@ static void hrTask() {
       }
       if (hrFound) {
         scan->stop();
+        hrConnectResult = -1;
+        xTaskNotifyGive(hrConnectHandle);   // connect sul core 0, il loop resta libero
         hrState = HR_CONNECTING;
       }
       break;
     }
 
     case HR_CONNECTING:
-      if (hrConnect()) {
+      if (hrConnectResult < 0) break;       // handshake in corso: non bloccare il loop
+      if (hrConnectResult > 0) {
         hrState = HR_READY;
+#if SERIAL_DEBUG
+        Serial.println("cardio pronto");
+#endif
       } else {
         hrNextTry = millis() + 5000;
         hrState = HR_IDLE;
@@ -1455,6 +1472,9 @@ void setup() {
   adv->enableScanResponse(true);
   adv->start();
 
+  // connessione cardio su task dedicato (core 0): il connect BLE non blocca il loop
+  xTaskCreatePinnedToCore(hrConnectWorker, "hrConnect", 4096, nullptr, 1, &hrConnectHandle, 0);
+
 #if SERIAL_DEBUG
   Serial.println("BikeGPS pronto, in attesa del telefono");
 #endif
@@ -1623,7 +1643,7 @@ static void taskSerial() {
             uint32_t t1 = micros();
             Serial.printf("  %-22s = %6lu us  (%.0f us/pressione)\n",
                           "10x tasto SET", (unsigned long)(t1 - t0), (t1 - t0) / 10.0f);
-            targetSpeed = sSave; targetHr = hrSave;
+            targetSpeed = sSave; targetHr = hrSave; saveSettings();   // la NVS torna ai valori pre-test
             lastTgt[0] = 0; drawValues();
           }
         }
@@ -1635,9 +1655,17 @@ static void taskSerial() {
     }
     else if (c == 'j') {
       // stato dello scheduler: quante esecuzioni e quanto sono in ritardo
-      Serial.printf("scheduler: esecuzioni=%lu jitterMax=%lu ms\n",
-                    (unsigned long)schedRuns, (unsigned long)schedMaxJitter);
+      Serial.printf("scheduler: esecuzioni=%lu jitterMax=%lu ms | hrConnect=%d\n",
+                    (unsigned long)schedRuns, (unsigned long)schedMaxJitter, (int)hrConnectResult);
       schedMaxJitter = 0;
+    }
+    else if (c == 'c') {
+      // test: forza un handshake BLE (indirizzo inesistente -> fallisce dopo il timeout)
+      // per verificare che il loop NON si blocchi mentre il worker connette.
+      hrAddress = NimBLEAddress(std::string("DE:AD:BE:EF:00:01"), BLE_ADDR_PUBLIC);
+      hrConnectResult = -1;
+      xTaskNotifyGive(hrConnectHandle);
+      Serial.println("test connect: richiesta al worker (core 0)");
     }
     else if (c == 'd') {
       printStatus();
