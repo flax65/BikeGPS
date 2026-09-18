@@ -49,7 +49,59 @@ con nessuna di queste schede: cambia solo la parte di disegno nello sketch.
 - USB nativa: appare come `/dev/ttyACM0` (a volte serve tenere premuto BOOT al collegamento).
 - FQBN: `esp32:esp32:lilygo_t_display_s3`.
 
-## Piano sketch T-Display / T-Display-S3 (da fare all'arrivo)
+## Sketch T-Display-S3 — FATTO
+
+Stato al 2026-09-18: **T-Display-S3 arrivato e funzionante**.
+
+- Hardware rilevato: `esptool` → **ESP32-S3** (QFN56, rev v0.2, 8 MB PSRAM,
+  USB-Serial/JTAG, MAC `a0:f2:62:e9:0d:14`) → è il T-Display-S3 da 1.9".
+- Porta seriale: `/dev/ttyACM0`.
+- Sketch: `esp32/BikeGPS_TDisplayS3/BikeGPS_TDisplayS3.ino` (lo sketch SSD1306
+  `esp32/BikeGPS_Mirror/` è rimasto intatto).
+
+### Setup TFT_eSPI — senza toccare la libreria
+
+Nella cartella dello sketch c'è **`tft_setup.h`** con la configurazione di
+`Setup206_LilyGo_T_Display_S3.h`. TFT_eSPI include da solo quel file
+(`__has_include(<tft_setup.h>)` in `TFT_eSPI.h`), quindi
+`~/Arduino/libraries/TFT_eSPI/User_Setup.h` **resta quello di sempre
+(GC9A01, rotondo)** e gli altri sketch non si rompono.
+
+### Comandi
+
+```bash
+cd ~/AndroidStudioProjects/GpsPosition/esp32/BikeGPS_TDisplayS3
+arduino-cli compile --upload -p /dev/ttyACM0 --fqbn esp32:esp32:lilygo_t_display_s3 .
+```
+
+### Problema risolto: libreria TFT_eSPI incompleta
+
+La compilazione falliva con `fatal error: Fonts/glcdfont.c: No such file or
+directory`: nella copia installata mancava **solo** quel file. Recuperato dalla
+release ufficiale **V2.5.43** (tag GitHub con la V maiuscola) e copiato in
+`~/Arduino/libraries/TFT_eSPI/Fonts/`. `diff -rq` con la release: l'unica altra
+differenza è `User_Setup.h` (personalizzato GC9A01, da tenere).
+
+### Layout scelto (320x170, rotazione 1)
+
+- **Pagina RIDE**: velocità gigante (font 7-segment 48 px) nel pannello
+  sinistro + DIST/TEMPO in basso e MEDIA/MAX a destra.
+- **Pagina STATS**: griglia 3x2 (DIST, TEMPO, MEDIA, MAX, QUOTA, PENDENZA).
+- **Pagina SYS**: griglia 3x2 (BLE, CARDIO, SATELLITI, BATTERIA, HEAP, UPTIME).
+- Righe di stato in alto: `BikeGPS` + stato BLE (verde/rosso) + batteria %.
+- GPIO0 corto = pagina avanti; GPIO0 lungo (>0,8 s) = retroilluminazione;
+  GPIO14 = pagina indietro.
+- Batteria: `analogReadMilliVolts(GPIO4)` x2 (partitore 1:2), media esponenziale,
+  percentuale 3,30-4,20 V.
+
+### Promemoria generali
+
+`LCD_POWER_ON` (GPIO15) va portato HIGH prima di `tft.init()`, altrimenti lo
+schermo resta nero.
+
+---
+
+## Piano storico sketch T-Display / T-Display-S3 (superato)
 
 1. Nuovo sketch separato `BikeGPS_TDisplay/` (o `BikeGPS_TDisplayS3/`) **senza
    toccare** quello SSD1306.

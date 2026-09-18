@@ -106,6 +106,32 @@ attivo basso). Per un pulsante esterno cambia `BUTTON_PIN` nello sketch.
 Se il BLE è scollegato il valore diventa `---` e compare `no BLE`
 (sulla pagina Battito compare `no HR` se la cintura non è connessa).
 
+### Variante LILYGO T-Display-S3 (1.9" IPS, ESP32-S3)
+
+Sketch separato: `esp32/BikeGPS_TDisplayS3/` (il codice BLE/parsing è identico).
+Schermo **320x170 landscape**, 3 pagine a tutto schermo:
+
+| Pagina | Contenuto |
+|---|---|
+| **RIDE** | velocità gigante (font 7-segment 48 px) + distanza, tempo, media, max |
+| **STATS** | griglia 3x2: distanza, tempo, media, max, quota, pendenza |
+| **SYS** | BLE, cardio, satelliti, batteria (%, V), heap libero, uptime |
+
+Pulsanti integrati:
+- **GPIO0** (BOOT) corto → pagina avanti, tenuto premuto (>0,8 s) → retroilluminazione on/off
+- **GPIO14** corto → pagina indietro
+
+Compila e carica (lo sketch usa un `tft_setup.h` locale, quindi non serve
+modificare `~/Arduino/libraries/TFT_eSPI/User_Setup.h`):
+
+```bash
+cd esp32/BikeGPS_TDisplayS3
+arduino-cli compile --upload -p /dev/ttyACM0 --fqbn esp32:esp32:lilygo_t_display_s3 .
+```
+
+La scheda si collega come `/dev/ttyACM0` (USB nativa ESP32-S3, USB mode =
+"Hardware CDC and JTAG"). Dettagli in `docs/display-notes.md`.
+
 ## Cardio (letto dall'ESP32)
 
 L'ESP32 fa anche da **central BLE** verso un cardiofrequenzimetro standard
