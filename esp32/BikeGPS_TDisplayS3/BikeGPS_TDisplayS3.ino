@@ -51,8 +51,6 @@
 #define HDR_H 26            // altezza della riga di stato in alto
 
 TFT_eSPI tft = TFT_eSPI();
-TFT_eSprite spr = TFT_eSprite(&tft);   // buffer di disegno: si disegna offline e poi un solo push
-                                       // -> nessun flicker sulle cifre grandi
 
 // ---------------------------------------------------------------- colori (Tokyo Night)
 static uint16_t C_BG, C_PANEL, C_BORDER, C_FG, C_DIM, C_BLUE, C_GREEN, C_RED, C_YELLOW, C_CYAN;
@@ -273,6 +271,22 @@ static int battPercent() {
 enum Page { P_RIDE, P_STATS, P_SYS, PAGE_COUNT };
 static uint8_t page = P_RIDE;
 static bool backlightOn = true;
+static bool freezeDraw = false;   // usato dal test 'r'/'v'/'k' per non sovrascrivere il colore
+
+// cache dei valori mostrati: si ridisegna solo se il testo cambia (meno flicker, meno lavoro)
+static char lastVals[6][24];
+static char lastHeroVal[24];
+static bool lastHeroLive = false;
+static char lastHeader[32];
+static uint16_t lastHeaderCol = 0;
+
+static void invalidateCache() {
+  memset(lastVals, 0, sizeof(lastVals));
+  lastHeroVal[0] = 0;
+  lastHeroLive = false;
+  lastHeader[0] = 0;
+  lastHeaderCol = 0;
+}
 
 // ---------------------------------------------------------------- geometria
 // Calcolata in setup() in base all'orientamento (ROTATION).
@@ -339,39 +353,52 @@ static bool hrLive()  { return tel.hrLastRx != 0 && (millis() - tel.hrLastRx <= 
 // Helper: testo con scelta automatica del font in base alla larghezza utile
 static void drawFitted(int x, int y, int w, const char *s, uint16_t fg, uint16_t bg) {
   uint8_t f = 4;
-  if (spr.textWidth(s, 4) > w - 16) f = 2;
-  if (spr.textWidth(s, 2) > w - 16) f = 1;
-  spr.setTextColor(fg, bg);
-  spr.setTextFont(f);
-  spr.drawString(s, x, y, f);
-  spr.setTextFont(2);
+  if (tft.textWidth(s, 4) > w - 16) f = 2;
+  if (tft.textWidth(s, 2) > w - 16) f = 1;
+  tft.setTextColor(fg, bg);
+  tft.setTextFont(f);
+  tft.setTextPadding(w - 12);   // cancella solo l'area del testo (anti-flicker)
+  tft.drawString(s, x, y, f);
+  tft.setTextPadding(0);
+  tft.setTextFont(2);
 }
 
 static void drawCell(int x, int y, int w, int h, const char *label, const char *value, uint16_t vc) {
-  spr.fillRoundRect(x, y, w, h, 6, C_PANEL);
-  spr.drawRoundRect(x, y, w, h, 6, C_BORDER);
-  spr.setTextDatum(TL_DATUM);
-  spr.setTextColor(C_DIM, C_PANEL);
-  spr.drawString(label, x + 8, y + 6, 2);
-  spr.setTextDatum(ML_DATUM);
+  tft.fillRoundRect(x, y, w, h, 6, C_PANEL);
+  tft.drawRoundRect(x, y, w, h, 6, C_BORDER);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_DIM, C_PANEL);
+  tft.drawString(label, x + 8, y + 6, 2);
+  tft.setTextDatum(ML_DATUM);
   drawFitted(x + 8, y + h - 16, w, value, vc, C_PANEL);
-  spr.setTextDatum(TL_DATUM);
+  tft.setTextDatum(TL_DATUM);
 }
 
-// riga di stato in alto: titolo a sinistra, BLE + batteria a destra
-static void drawHeader() {
-  spr.fillRect(0, 0, spr.width(), HDR_H, C_BG);
-  spr.setTextDatum(TL_DATUM);
-  spr.setTextColor(C_BLUE, C_BG);
-  spr.drawString("BikeGPS", 6, 5, 2);
+// intestazione statica (disegnata una volta per pagina)
+static void drawHeaderStatic() {
+  tft.fillRect(0, 0, W, HDR_H, C_BG);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_BLUE, C_BG);
+  tft.drawString("BikeGPS", 6, 5, 2);
+}
 
+// parte variabile dell'intestazione: stato BLE + batteria (solo se cambia)
+static void updateHeader() {
   char st[32];
-  const char *ble = bleConnected ? "BLE" : "no BLE";
-  snprintf(st, sizeof(st), "%s  %d%%", ble, battPercent());
-  spr.setTextDatum(TR_DATUM);
-  spr.setTextColor(bleConnected ? C_GREEN : C_RED, C_BG);
-  spr.drawString(st, spr.width() - 6, 5, 2);
-  spr.setTextDatum(TL_DATUM);
+  snprintf(st, sizeof(st), "%s  %d%%", bleConnected ? "BLE" : "no BLE", battPercent());
+  uint16_t col = bleConnected ? C_GREEN : C_RED;
+  if (strcmp(st, lastHeader) == 0 && col == lastHeaderCol) return;
+
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(col, C_BG);
+  tft.setTextPadding(100);          // cancella solo l'area del testo (anti-flicker)
+  tft.drawString(st, W - 6, 5, 2);
+  tft.setTextPadding(0);
+  tft.setTextDatum(TL_DATUM);
+
+  strncpy(lastHeader, st, sizeof(lastHeader) - 1);
+  lastHeader[sizeof(lastHeader) - 1] = 0;
+  lastHeaderCol = col;
 }
 
 // --- formattazioni condivise
@@ -396,12 +423,13 @@ static const char *const SYS_LABELS[6]   = {"BLE", "CARDIO bpm", "SATELLITI", "B
 // ---------------------------------------------------------------- pagina RIDE
 static void layoutRide() {
   // pannello velocita' + etichetta unita'
-  spr.fillRoundRect(heroX, heroY, heroW, heroH, 6, C_PANEL);
-  spr.drawRoundRect(heroX, heroY, heroW, heroH, 6, C_BORDER);
-  spr.setTextDatum(BR_DATUM);
-  spr.setTextColor(C_DIM, C_PANEL);
-  spr.drawString("km/h", heroX + heroW - 8, heroY + heroH - 6, 2);
-  spr.setTextDatum(TL_DATUM);
+  tft.fillRoundRect(heroX, heroY, heroW, heroH, 6, C_PANEL);
+  tft.drawRoundRect(heroX, heroY, heroW, heroH, 6, C_BORDER);
+  tft.setTextDatum(BR_DATUM);
+  tft.setTextColor(C_DIM, C_PANEL);
+  tft.drawString("km/h", heroX + heroW - 8, heroY + heroH - 6, 2);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawFastHLine(heroX + 8, heroY + heroH - 24, heroW - 16, C_BORDER);
 
   if (portrait) {
     // verticale: sotto l'hero la griglia 2x2 con distanza, tempo, media, max
@@ -425,16 +453,23 @@ static void updateRide() {
   bool live = gpsLive() || hrLive() || tel.lastRx != 0;
 
   // velocita' gigante (font 7 = "7 segment" 48 px)
-  spr.fillRect(heroX + 3, heroY + 3, heroW - 6, heroH - 26, C_PANEL);
   if (live) snprintf(v, sizeof(v), "%.1f", tel.spd);
   else      snprintf(v, sizeof(v), "-.-");
-  spr.setTextDatum(MC_DATUM);
-  spr.setTextColor(live ? C_FG : C_DIM, C_PANEL);
-  spr.drawString(v, heroX + heroW / 2, heroY + heroH / 2 - 8, 7);
-  spr.setTextDatum(TL_DATUM);
-  spr.drawFastHLine(heroX + 8, heroY + heroH - 24, heroW - 16, C_BORDER);
-  spr.setTextColor(C_DIM, C_PANEL);
-  spr.drawString(live ? "" : "no GPS", heroX + 8, heroY + heroH - 20, 2);
+  if (strcmp(v, lastHeroVal) != 0 || live != lastHeroLive) {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(live ? C_FG : C_DIM, C_PANEL);
+    tft.setTextPadding(heroW - 12);   // cancella solo l'area del testo (anti-flicker)
+    tft.drawString(v, heroX + heroW / 2, heroY + heroH / 2 - 8, 7);
+    tft.setTextPadding(0);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(C_DIM, C_PANEL);
+    tft.setTextPadding(heroW - 16);
+    tft.drawString(live ? "" : "no GPS", heroX + 8, heroY + heroH - 20, 2);
+    tft.setTextPadding(0);
+    strncpy(lastHeroVal, v, sizeof(lastHeroVal) - 1);
+    lastHeroVal[sizeof(lastHeroVal) - 1] = 0;
+    lastHeroLive = live;
+  }
 
   const char *vals[6];
   uint16_t cols[6];
@@ -450,7 +485,7 @@ static void updateRide() {
   const int gx = heroX + heroW + 4, gw = W - gx - 4;
   const int cy = heroY + heroH + 4, ch = H - cy - 4;
   const int cw = (heroW - 4) / 2;
-  spr.setTextDatum(ML_DATUM);
+  tft.setTextDatum(ML_DATUM);
   if (live) snprintf(v, sizeof(v), "%.2f", tel.dst); else strcpy(v, "--");
   drawFitted(heroX + 8, cy + ch - 16, cw, v, C_CYAN, C_PANEL);
   if (live) fmtTime(tel.mov, v, sizeof(v)); else strcpy(v, "--");
@@ -459,7 +494,7 @@ static void updateRide() {
   drawFitted(gx + 8, heroY + (heroH - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
   if (live) snprintf(v, sizeof(v), "%.1f", tel.mx); else strcpy(v, "--");
   drawFitted(gx + 8, heroY + (heroH - 4) / 2 + 4 + (heroH - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
-  spr.setTextDatum(TL_DATUM);
+  tft.setTextDatum(TL_DATUM);
 }
 
 // ---------------------------------------------------------------- pagine a griglia
@@ -478,13 +513,16 @@ static void layoutGrid(const char *const labels[6], int n) {
 
 static void updateGrid(const char *const labels[6], const char *const vals[6], const uint16_t cols[6], int n) {
   (void)labels;
-  spr.setTextDatum(ML_DATUM);
+  tft.setTextDatum(ML_DATUM);
   for (int i = 0; i < n; i++) {
+    if (strcmp(lastVals[i], vals[i]) == 0) continue;   // invariato: non ridisegnare
     int x, y;
     gridCell(i, x, y);
     drawFitted(x + 8, y + gH - 16, gW, vals[i], cols[i], C_PANEL);
+    strncpy(lastVals[i], vals[i], sizeof(lastVals[i]) - 1);
+    lastVals[i][sizeof(lastVals[i]) - 1] = 0;
   }
-  spr.setTextDatum(TL_DATUM);
+  tft.setTextDatum(TL_DATUM);
 }
 
 static void statsValues(const char *vals[6], uint16_t cols[6]) {
@@ -523,8 +561,9 @@ static void sysValues(const char *vals[6], uint16_t cols[6]) {
 static void drawFull() {
   const char *vals[6];
   uint16_t cols[6];
-  spr.fillScreen(C_BG);
-  drawHeader();
+  tft.fillScreen(C_BG);
+  invalidateCache();
+  drawHeaderStatic();
   switch (page) {
     case P_RIDE:
       layoutRide();
@@ -544,13 +583,12 @@ static void drawFull() {
       updateGrid(SYS_LABELS, vals, cols, 6);
       break;
   }
-  spr.pushSprite(0, 0);
 }
 
 static void drawValues() {
   const char *vals[6];
   uint16_t cols[6];
-  drawHeader();
+  updateHeader();
   switch (page) {
     case P_RIDE:
       updateRide();
@@ -567,7 +605,6 @@ static void drawValues() {
       updateGrid(SYS_LABELS, vals, cols, 6);
       break;
   }
-  spr.pushSprite(0, 0);
 }
 
 // ---------------------------------------------------------------- pulsanti
@@ -578,6 +615,17 @@ static Button btn2 = {PIN_BTN2, HIGH, 0, false};
 static void setBacklight(bool on) {
   backlightOn = on;
   digitalWrite(TFT_BL, on ? TFT_BACKLIGHT_ON : !TFT_BACKLIGHT_ON);
+#if SERIAL_DEBUG
+  Serial.printf("backlight %s (pin %d = %d)\n", on ? "ON" : "OFF", TFT_BL, digitalRead(TFT_BL));
+#endif
+}
+
+static void printStatus() {
+#if SERIAL_DEBUG
+  Serial.printf("stato: backlightOn=%d pinBL(%d)=%d lcdPower(%d)=%d heap=%u page=%d/%d portrait=%d up=%lus\n",
+                backlightOn, TFT_BL, digitalRead(TFT_BL), PIN_LCD_POWER, digitalRead(PIN_LCD_POWER),
+                (unsigned)ESP.getFreeHeap(), page + 1, pageCount, (int)portrait, (unsigned long)(millis() / 1000));
+#endif
 }
 
 static void handleButtons() {
@@ -647,11 +695,6 @@ void setup() {
   setBacklight(true);
 
   // buffer di disegno (prima del BLE: cosi' l'allocazione ha tutta la RAM libera)
-  if (spr.createSprite(W, H) == nullptr) {
-#if SERIAL_DEBUG
-    Serial.println("ERRORE: sprite non allocato, disegno diretto (flicker)");
-#endif
-  }
 
   C_BG     = rgb(0x16, 0x17, 0x20);
   C_PANEL  = rgb(0x1f, 0x23, 0x35);
@@ -717,17 +760,39 @@ void loop() {
   }
 
   static uint32_t lastDraw = 0;
-  if (millis() - lastDraw >= 250) {
+  if (!freezeDraw && millis() - lastDraw >= 250) {
     lastDraw = millis();
     drawValues();
   }
 
   // comandi di test da seriale: n = pagina avanti, p = indietro, b = retroilluminazione
+  //   d = riaccendi + ridisegna, s = stato pin/heap
+  //   r = schermo rosso pieno (test pannello diretto), v = verde, k = nero
   if (Serial.available()) {
     int c = Serial.read();
-    if (c == 'n') { page = (page + 1) % pageCount; drawFull(); }
-    else if (c == 'p') { page = (page + pageCount - 1) % pageCount; drawFull(); }
+    if (c == 'n') { freezeDraw = false; page = (page + 1) % pageCount; drawFull(); }
+    else if (c == 'p') { freezeDraw = false; page = (page + pageCount - 1) % pageCount; drawFull(); }
     else if (c == 'b') setBacklight(!backlightOn);
+    else if (c == 's') printStatus();
+    else if (c == 'r' || c == 'v' || c == 'k') {
+      // test diretto sul pannello, senza passare dallo sprite
+      uint16_t col = (c == 'r') ? TFT_RED : (c == 'v') ? TFT_GREEN : TFT_BLACK;
+      freezeDraw = true;
+      tft.fillScreen(col);
+#if SERIAL_DEBUG
+      Serial.printf("test pannello: fillScreen(0x%04X) colore=%c\n", col, c);
+#endif
+    }
+    else if (c == 'd') {
+      printStatus();
+      digitalWrite(PIN_LCD_POWER, HIGH);
+      tft.init();                       // re-init del pannello
+      tft.setRotation(ROTATION);
+      setBacklight(true);
+      freezeDraw = false;
+      drawFull();
+      printStatus();
+    }
   }
   delay(5);
 }
