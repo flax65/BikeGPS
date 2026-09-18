@@ -280,14 +280,14 @@ enum Page { P_RIDE, P_COST_SPEED, P_COST_BPM, P_SETUP, P_DIAG, PAGE_COUNT };
 static uint8_t page = P_RIDE;
 static bool backlightOn = true;
 static bool freezeDraw = false;   // usato dal test 'r'/'v'/'k' per non sovrascrivere il colore
-static bool trainingMode = false; // le pagine COST sono visibili solo in modalita' allenamento
 static uint32_t bootTime = 0;     // usato per ignorare i tasti nei primi istanti dopo il boot
 
-// pagina successiva/precedente saltando quelle nascoste
+// Pagina successiva/precedente. La SETUP (soglie cardio) non fa parte del giro:
+// si apre tenendo premuti entrambi i tasti.
 static uint8_t advancePage(uint8_t p, int dir) {
   for (int k = 0; k < PAGE_COUNT; k++) {
     p = (uint8_t)((p + dir + PAGE_COUNT) % PAGE_COUNT);
-    if (trainingMode || (p != P_COST_SPEED && p != P_COST_BPM)) return p;
+    if (p != P_SETUP) return p;
   }
   return p;
 }
@@ -1074,7 +1074,6 @@ static void loadSettings() {
   targetHr    = prefs.getInt("tgtHr", targetHr);
   prefs.end();
   page = P_RIDE;                 // si parte sempre dalla pagina RIDE
-  trainingMode = false;
   for (int i = 1; i < N_ZLIM; i++) if (zoneLim[i] <= zoneLim[i - 1]) zoneLim[i] = zoneLim[i - 1] + 1;
 }
 
@@ -1223,17 +1222,21 @@ static void handleButtons() {
   bool s1 = digitalRead(btn1.pin);
   bool s2 = digitalRead(btn2.pin);
 
-  // --- entrambi i tasti premuti per >1 s: mostra/nascondi la modalita' allenamento
+  // --- entrambi i tasti premuti per >1 s: apre/chiude la pagina SOGLIE CARDIO
   static uint32_t bothSince = 0;
   static bool bothFired = false;
   if (s1 == LOW && s2 == LOW) {
     if (bothSince == 0) bothSince = millis();
     if (!bothFired && millis() - bothSince > 1000) {
       bothFired = true;
-      trainingMode = !trainingMode;
-      page = trainingMode ? P_COST_SPEED : P_RIDE;
+      if (page == P_SETUP) {
+        page = P_RIDE;
+      } else {
+        page = P_SETUP;
+        setupField = 0;
+      }
 #if SERIAL_DEBUG
-      Serial.printf("modalita' allenamento %s\n", trainingMode ? "ON" : "OFF");
+      Serial.printf("pagina -> %s\n", pageTitle());
 #endif
       invalidateCache();
       drawFull();
@@ -1426,13 +1429,17 @@ void loop() {
       invalidateCache();
       drawFull();
     } else if (c == 'a') {
-      // test: attiva/disattiva la modalita' allenamento
-      trainingMode = !trainingMode;
-      page = trainingMode ? P_COST_SPEED : P_RIDE;
+      // test: apre/chiude la pagina SOGLIE CARDIO
+      if (page == P_SETUP) {
+        page = P_RIDE;
+      } else {
+        page = P_SETUP;
+        setupField = 0;
+      }
       invalidateCache();
       drawFull();
 #if SERIAL_DEBUG
-      Serial.printf("modalita' allenamento %s\n", trainingMode ? "ON" : "OFF");
+      Serial.printf("pagina -> %s\n", pageTitle());
 #endif
     } else if (c == 'r' || c == 'v' || c == 'k') {
       // test diretto sul pannello, senza passare dallo sprite
