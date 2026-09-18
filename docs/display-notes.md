@@ -82,17 +82,35 @@ release ufficiale **V2.5.43** (tag GitHub con la V maiuscola) e copiato in
 `~/Arduino/libraries/TFT_eSPI/Fonts/`. `diff -rq` con la release: l'unica altra
 differenza è `User_Setup.h` (personalizzato GC9A01, da tenere).
 
-### Layout scelto (320x170, rotazione 1)
+### Layout scelto
 
-- **Pagina RIDE**: velocità gigante (font 7-segment 48 px) nel pannello
-  sinistro + DIST/TEMPO in basso e MEDIA/MAX a destra.
-- **Pagina STATS**: griglia 3x2 (DIST, TEMPO, MEDIA, MAX, QUOTA, PENDENZA).
-- **Pagina SYS**: griglia 3x2 (BLE, CARDIO, SATELLITI, BATTERIA, HEAP, UPTIME).
+**Verticale (170x320, rotazione 0 — impostazione attuale)**:
+- **Pagina RIDE**: velocità gigante (font 7-segment 48 px) che occupa tutta la
+  larghezza in alto + griglia 2x2 sotto (DIST, TEMPO, MEDIA, MAX).
+- **Pagina SYS**: griglia 2x3 a tutta altezza (BLE, CARDIO, SATELLITI, BATTERIA,
+  HEAP, UPTIME).
+- In verticale le statistiche complete stanno nella pagina RIDE, quindi le pagine
+  sono **2** (in orizzontale 3).
+
+**Orizzontale (320x170, rotazione 1)**:
+- **RIDE**: velocità gigante a sinistra + DIST/TEMPO in basso e MEDIA/MAX a destra.
+- **STATS**: griglia 3x2 (DIST, TEMPO, MEDIA, MAX, QUOTA, PENDENZA).
+- **SYS**: griglia 3x2 (BLE, CARDIO, SATELLITI, BATTERIA, HEAP, UPTIME).
+
+La geometria è scelta a runtime in `setupGeometry()`/`setGrid()` in base a
+`tft.width()/height()`, quindi basta cambiare `ROTATION` (0/2 verticale,
+1/3 orizzontale) per passare da un layout all'altro.
+
+Comune ai due orientamenti:
 - Righe di stato in alto: `BikeGPS` + stato BLE (verde/rosso) + batteria %.
 - GPIO0 corto = pagina avanti; GPIO0 lungo (>0,8 s) = retroilluminazione;
   GPIO14 = pagina indietro.
 - Batteria: `analogReadMilliVolts(GPIO4)` x2 (partitore 1:2), media esponenziale,
   percentuale 3,30-4,20 V.
+
+Nota di sviluppo: niente `enum` come parametro di funzione (l'auto-prototyping di
+Arduino mette i prototipi in cima e il tipo non è ancora dichiarato) → usare
+`#define`/`uint8_t`.
 
 ### Promemoria generali
 

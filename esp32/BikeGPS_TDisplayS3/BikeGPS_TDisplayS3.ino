@@ -47,7 +47,7 @@
 
 #define SERIAL_DEBUG 1
 
-#define ROTATION 1          // 1 o 3: cambia il verso del display
+#define ROTATION 0          // 0/2 = verticale, 1/3 = orizzontale (cambia il verso)
 #define HDR_H 26            // altezza della riga di stato in alto
 
 TFT_eSPI tft = TFT_eSPI();
@@ -272,6 +272,65 @@ enum Page { P_RIDE, P_STATS, P_SYS, PAGE_COUNT };
 static uint8_t page = P_RIDE;
 static bool backlightOn = true;
 
+// ---------------------------------------------------------------- geometria
+// Calcolata in setup() in base all'orientamento (ROTATION).
+static int W, H;
+static bool portrait = false;
+static uint8_t pageCount = PAGE_COUNT;   // in verticale le statistiche sono nella pagina RIDE
+
+static int heroX, heroY, heroW, heroH;   // pannello della velocita'
+
+// griglia corrente (impostata da setGrid)
+static int gCols, gRows, gX, gY, gW, gH;
+
+// GRID_FULL = griglia della pagina intera; GRID_RIDE = griglia sotto l'hero (solo verticale)
+#define GRID_FULL 0
+#define GRID_RIDE 1
+
+static void setGrid(uint8_t mode, int nItems) {
+  const int gap = 4;
+  if (portrait) {
+    gCols = 2;
+    if (mode == GRID_RIDE) {
+      gRows = 2;
+      gX = 4;
+      gY = heroY + heroH + gap;
+    } else {
+      gRows = (nItems > 4) ? 3 : 2;
+      gX = 4;
+      gY = HDR_H + gap;
+    }
+    gW = (W - gap * 3) / 2;
+    gH = ((H - gY - gap) - (gRows - 1) * gap) / gRows;
+  } else {
+    gCols = 3;
+    gRows = 2;
+    gX = 4;
+    gY = HDR_H + 3;
+    gW = (W - gap * 4) / 3;
+    gH = ((H - gY - gap) - (gRows - 1) * gap) / gRows;
+  }
+}
+
+static void setupGeometry() {
+  W = tft.width();
+  H = tft.height();
+  portrait = (H > W);
+  if (portrait) {
+    pageCount = 2;                        // RIDE (con statistiche) + SYS
+    heroX = 4;
+    heroY = HDR_H + 4;
+    heroW = W - 8;
+    heroH = 124;
+  } else {
+    pageCount = PAGE_COUNT;
+    heroX = 4;
+    heroY = HDR_H + 3;
+    heroW = 190;
+    heroH = 83;
+  }
+}
+
 static bool gpsLive() { return bleConnected && tel.lastRx != 0 && (millis() - tel.lastRx <= 5000); }
 static bool hrLive()  { return tel.hrLastRx != 0 && (millis() - tel.hrLastRx <= 5000); }
 
@@ -328,99 +387,103 @@ static void fmtUptime(char *buf, size_t n) {
            (unsigned long)(s / 3600), (unsigned long)((s % 3600) / 60), (unsigned long)(s % 60));
 }
 
-// ---------------------------------------------------------------- pagina RIDE
-// geometria: hero velocita' a sinistra, 4 celle intorno
-static void layoutRide() {
-  const int W = tft.width(), H = tft.height();
-  const int hx = 4, hy = HDR_H + 3, hw = 190, hh = 83;
-  const int gx = hx + hw + 4, gw = W - gx - 4;
-  const int cy = hy + hh + 4, ch = H - cy - 4;
+// etichette delle pagine a griglia (usate anche dalla pagina RIDE in verticale)
+static const char *const STATS_LABELS[6] = {"DIST km", "TEMPO", "MEDIA km/h", "MAX km/h", "QUOTA m", "PENDENZA %"};
+static const char *const SYS_LABELS[6]   = {"BLE", "CARDIO bpm", "SATELLITI", "BATTERIA", "HEAP", "UPTIME"};
 
+// ---------------------------------------------------------------- pagina RIDE
+static void layoutRide() {
   // pannello velocita' + etichetta unita'
-  tft.fillRoundRect(hx, hy, hw, hh, 6, C_PANEL);
-  tft.drawRoundRect(hx, hy, hw, hh, 6, C_BORDER);
+  tft.fillRoundRect(heroX, heroY, heroW, heroH, 6, C_PANEL);
+  tft.drawRoundRect(heroX, heroY, heroW, heroH, 6, C_BORDER);
   tft.setTextDatum(BR_DATUM);
   tft.setTextColor(C_DIM, C_PANEL);
-  tft.drawString("km/h", hx + hw - 8, hy + hh - 6, 2);
-
-  // distanza e tempo in basso a sinistra
-  drawCell(hx, cy, (hw - 4) / 2, ch, "DIST km", "--", C_CYAN);
-  drawCell(hx + (hw - 4) / 2 + 4, cy, (hw - 4) / 2, ch, "TEMPO", "--", C_CYAN);
-
-  // media e max a destra
-  drawCell(gx, hy, gw, (hh - 4) / 2, "MEDIA km/h", "--", C_YELLOW);
-  drawCell(gx, hy + (hh - 4) / 2 + 4, gw, (hh - 4) / 2, "MAX km/h", "--", C_YELLOW);
+  tft.drawString("km/h", heroX + heroW - 8, heroY + heroH - 6, 2);
   tft.setTextDatum(TL_DATUM);
+
+  if (portrait) {
+    // verticale: sotto l'hero la griglia 2x2 con distanza, tempo, media, max
+    setGrid(GRID_RIDE, 4);
+    layoutGrid(STATS_LABELS, 4);
+    return;
+  }
+
+  // orizzontale: distanza/tempo sotto l'hero, media/max a destra
+  const int gx = heroX + heroW + 4, gw = W - gx - 4;
+  const int cy = heroY + heroH + 4, ch = H - cy - 4;
+  const int cw = (heroW - 4) / 2;
+  drawCell(heroX, cy, cw, ch, "DIST km", "--", C_CYAN);
+  drawCell(heroX + cw + 4, cy, cw, ch, "TEMPO", "--", C_CYAN);
+  drawCell(gx, heroY, gw, (heroH - 4) / 2, "MEDIA km/h", "--", C_YELLOW);
+  drawCell(gx, heroY + (heroH - 4) / 2 + 4, gw, (heroH - 4) / 2, "MAX km/h", "--", C_YELLOW);
 }
 
 static void updateRide() {
-  const int W = tft.width(), H = tft.height();
-  const int hx = 4, hy = HDR_H + 3, hw = 190, hh = 83;
-  const int gx = hx + hw + 4, gw = W - gx - 4;
-  const int cy = hy + hh + 4, ch = H - cy - 4;
-  const int cw = (hw - 4) / 2;
   char v[24];
+  bool live = gpsLive() || hrLive() || tel.lastRx != 0;
 
   // velocita' gigante (font 7 = "7 segment" 48 px)
-  bool live = gpsLive() || hrLive() || tel.lastRx != 0;
-  tft.fillRect(hx + 3, hy + 3, hw - 6, hh - 26, C_PANEL);
+  tft.fillRect(heroX + 3, heroY + 3, heroW - 6, heroH - 26, C_PANEL);
   if (live) snprintf(v, sizeof(v), "%.1f", tel.spd);
   else      snprintf(v, sizeof(v), "-.-");
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(live ? C_FG : C_DIM, C_PANEL);
-  tft.drawString(v, hx + hw / 2, hy + 38, 7);
+  tft.drawString(v, heroX + heroW / 2, heroY + heroH / 2 - 8, 7);
   tft.setTextDatum(TL_DATUM);
-  tft.drawFastHLine(hx + 8, hy + hh - 24, hw - 16, C_BORDER);
+  tft.drawFastHLine(heroX + 8, heroY + heroH - 24, heroW - 16, C_BORDER);
   tft.setTextColor(C_DIM, C_PANEL);
-  tft.drawString(live ? "" : "no GPS", hx + 8, hy + hh - 20, 2);
+  tft.drawString(live ? "" : "no GPS", heroX + 8, heroY + heroH - 20, 2);
 
-  // celle
+  const char *vals[6];
+  uint16_t cols[6];
+
+  if (portrait) {
+    setGrid(GRID_RIDE, 4);
+    statsValues(vals, cols);
+    updateGrid(STATS_LABELS, vals, cols, 4);
+    return;
+  }
+
+  // orizzontale
+  const int gx = heroX + heroW + 4, gw = W - gx - 4;
+  const int cy = heroY + heroH + 4, ch = H - cy - 4;
+  const int cw = (heroW - 4) / 2;
   tft.setTextDatum(ML_DATUM);
   if (live) snprintf(v, sizeof(v), "%.2f", tel.dst); else strcpy(v, "--");
-  drawFitted(hx + 8, cy + ch - 16, cw, v, C_CYAN, C_PANEL);
-
+  drawFitted(heroX + 8, cy + ch - 16, cw, v, C_CYAN, C_PANEL);
   if (live) fmtTime(tel.mov, v, sizeof(v)); else strcpy(v, "--");
-  drawFitted(hx + cw + 12, cy + ch - 16, cw, v, C_CYAN, C_PANEL);
-
+  drawFitted(heroX + cw + 12, cy + ch - 16, cw, v, C_CYAN, C_PANEL);
   if (live) fmtAvg(v, sizeof(v)); else strcpy(v, "--");
-  drawFitted(gx + 8, hy + (hh - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
-
+  drawFitted(gx + 8, heroY + (heroH - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
   if (live) snprintf(v, sizeof(v), "%.1f", tel.mx); else strcpy(v, "--");
-  drawFitted(gx + 8, hy + (hh - 4) / 2 + 4 + (hh - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
+  drawFitted(gx + 8, heroY + (heroH - 4) / 2 + 4 + (heroH - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
   tft.setTextDatum(TL_DATUM);
 }
 
 // ---------------------------------------------------------------- pagine a griglia
-static void layoutGrid(const char *const labels[6]) {
-  const int W = tft.width(), H = tft.height();
-  const int gap = 4;
-  const int cw = (W - gap * 4) / 3;
-  const int y0 = HDR_H + 3;
-  const int chh = (H - y0 - gap * 3) / 2;
-  for (int i = 0; i < 6; i++) {
-    int col = i % 3, row = i / 3;
-    drawCell(gap + col * (cw + gap), y0 + row * (chh + gap), cw, chh, labels[i], "--", C_FG);
+static void gridCell(int i, int &x, int &y) {
+  x = gX + (i % gCols) * (gW + 4);
+  y = gY + (i / gCols) * (gH + 4);
+}
+
+static void layoutGrid(const char *const labels[6], int n) {
+  for (int i = 0; i < n; i++) {
+    int x, y;
+    gridCell(i, x, y);
+    drawCell(x, y, gW, gH, labels[i], "--", C_FG);
   }
 }
 
-static void updateGrid(const char *const labels[6], const char *const vals[6], const uint16_t cols[6]) {
-  const int W = tft.width(), H = tft.height();
-  const int gap = 4;
-  const int cw = (W - gap * 4) / 3;
-  const int y0 = HDR_H + 3;
-  const int chh = (H - y0 - gap * 3) / 2;
+static void updateGrid(const char *const labels[6], const char *const vals[6], const uint16_t cols[6], int n) {
   (void)labels;
   tft.setTextDatum(ML_DATUM);
-  for (int i = 0; i < 6; i++) {
-    int col = i % 3, row = i / 3;
-    int x = gap + col * (cw + gap), y = y0 + row * (chh + gap);
-    drawFitted(x + 8, y + chh - 16, cw, vals[i], cols[i], C_PANEL);
+  for (int i = 0; i < n; i++) {
+    int x, y;
+    gridCell(i, x, y);
+    drawFitted(x + 8, y + gH - 16, gW, vals[i], cols[i], C_PANEL);
   }
   tft.setTextDatum(TL_DATUM);
 }
-
-static const char *const STATS_LABELS[6] = {"DIST km", "TEMPO", "MEDIA km/h", "MAX km/h", "QUOTA m", "PENDENZA %"};
-static const char *const SYS_LABELS[6]   = {"BLE", "CARDIO bpm", "SATELLITI", "BATTERIA", "HEAP", "UPTIME"};
 
 static void statsValues(const char *vals[6], uint16_t cols[6]) {
   static char a[24], b[24], c[24], d[24], e[24], f[24];
@@ -461,9 +524,23 @@ static void drawFull() {
   tft.fillScreen(C_BG);
   drawHeader();
   switch (page) {
-    case P_RIDE:  layoutRide(); updateRide(); break;
-    case P_STATS: layoutGrid(STATS_LABELS); statsValues(vals, cols); updateGrid(STATS_LABELS, vals, cols); break;
-    case P_SYS:   layoutGrid(SYS_LABELS);   sysValues(vals, cols);   updateGrid(SYS_LABELS, vals, cols);   break;
+    case P_RIDE:
+      layoutRide();
+      updateRide();
+      break;
+    case P_STATS:
+      if (portrait) break;   // in verticale le statistiche sono nella pagina RIDE
+      setGrid(GRID_FULL, 6);
+      layoutGrid(STATS_LABELS, 6);
+      statsValues(vals, cols);
+      updateGrid(STATS_LABELS, vals, cols, 6);
+      break;
+    case P_SYS:
+      setGrid(GRID_FULL, 6);
+      layoutGrid(SYS_LABELS, 6);
+      sysValues(vals, cols);
+      updateGrid(SYS_LABELS, vals, cols, 6);
+      break;
   }
 }
 
@@ -471,9 +548,20 @@ static void drawValues() {
   const char *vals[6];
   uint16_t cols[6];
   switch (page) {
-    case P_RIDE:  updateRide(); break;
-    case P_STATS: statsValues(vals, cols); updateGrid(STATS_LABELS, vals, cols); break;
-    case P_SYS:   sysValues(vals, cols);   updateGrid(SYS_LABELS, vals, cols);   break;
+    case P_RIDE:
+      updateRide();
+      break;
+    case P_STATS:
+      if (portrait) break;
+      setGrid(GRID_FULL, 6);
+      statsValues(vals, cols);
+      updateGrid(STATS_LABELS, vals, cols, 6);
+      break;
+    case P_SYS:
+      setGrid(GRID_FULL, 6);
+      sysValues(vals, cols);
+      updateGrid(SYS_LABELS, vals, cols, 6);
+      break;
   }
 }
 
@@ -497,7 +585,7 @@ static void handleButtons() {
   }
   if (n1 == HIGH && btn1.last == LOW) {
     if (!btn1.longFired && millis() - btn1.tDown > 30) {
-      page = (page + 1) % PAGE_COUNT;
+      page = (page + 1) % pageCount;
       drawFull();
     }
   }
@@ -507,7 +595,7 @@ static void handleButtons() {
   bool n2 = digitalRead(btn2.pin);
   if (n2 == LOW && btn2.last == HIGH) { btn2.tDown = millis(); }
   if (n2 == HIGH && btn2.last == LOW && millis() - btn2.tDown > 30) {
-    page = (page + PAGE_COUNT - 1) % PAGE_COUNT;
+    page = (page + pageCount - 1) % pageCount;
     drawFull();
   }
   btn2.last = n2;
@@ -533,6 +621,7 @@ void setup() {
 
   tft.init();
   tft.setRotation(ROTATION);
+  setupGeometry();
   setBacklight(true);
 
   C_BG     = rgb(0x16, 0x17, 0x20);

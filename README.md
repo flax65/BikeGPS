@@ -109,12 +109,13 @@ Se il BLE è scollegato il valore diventa `---` e compare `no BLE`
 ### Variante LILYGO T-Display-S3 (1.9" IPS, ESP32-S3)
 
 Sketch separato: `esp32/BikeGPS_TDisplayS3/` (il codice BLE/parsing è identico).
-Schermo **320x170 landscape**, 3 pagine a tutto schermo:
+Schermo **verticale 170x320** (rotazione 0; basta cambiare `ROTATION` per
+l'orizzontale) — in verticale 2 pagine, in orizzontale 3:
 
 | Pagina | Contenuto |
 |---|---|
-| **RIDE** | velocità gigante (font 7-segment 48 px) + distanza, tempo, media, max |
-| **STATS** | griglia 3x2: distanza, tempo, media, max, quota, pendenza |
+| **RIDE** | velocità gigante (font 7-segment 48 px) + distanza, tempo, media, max (in verticale anche quota e pendenza nella griglia sotto) |
+| **STATS** | solo orizzontale: griglia 3x2 con distanza, tempo, media, max, quota, pendenza |
 | **SYS** | BLE, cardio, satelliti, batteria (%, V), heap libero, uptime |
 
 Pulsanti integrati:
