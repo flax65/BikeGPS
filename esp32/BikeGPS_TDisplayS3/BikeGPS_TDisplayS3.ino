@@ -222,11 +222,14 @@ static uint32_t hrScanAt = 0;      // inizio dell'ultima scansione (per il retry
 // attivi il callback onResult arriva anche se la fascia era gia' stata vista:
 // senza questo, dopo una perdita non viene piu' ritrovata (hrFound resta false).
 static void hrScanStart() {
+  // Stessi parametri del vecchio sketch (che funziona): niente duplicati e
+  // start semplice. Con i duplicati attivi il controller riportava migliaia di
+  // pacchetti e la Geonaute non veniva mai consegnata.
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->stop();
-  scan->setScanCallbacks(&hrScanCallbacks, true);   // true = vogliamo i duplicati
+  scan->setScanCallbacks(&hrScanCallbacks, false);
   scan->setActiveScan(true);
-  scan->start(0, true, true);                       // restart: riparte sempre
+  scan->start(0, true, false);
   hrScanAt = millis();
 }
 
@@ -317,9 +320,6 @@ static void hrTask() {
       if (hrFound) {
         NimBLEDevice::getScan()->stop();
         hrStateTo(HR_CONNECTING, "fascia trovata");
-      } else if (millis() - hrScanAt > 30000) {
-        hrScanStart();                   // rete di sicurezza: riavvia la ricerca
-        hrStateTo(HR_SCANNING, "scansione riavviata");
       }
       break;
 
