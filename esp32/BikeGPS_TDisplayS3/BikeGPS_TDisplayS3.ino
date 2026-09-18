@@ -47,6 +47,9 @@
 // Se col display sul manubrio ti risultano invertiti, scambia questi due define.
 #define BTN_SET  PIN_BTN1
 #define BTN_PAGE PIN_BTN2
+
+#define DEBOUNCE_MS      50    // anti-rimbalzo dei tastini
+#define BUTTON_GUARD_MS  2000  // dopo il boot i tasti sono ignorati per questo tempo
 #define PIN_LCD_POWER 15    // LCD_POWER_ON: va portato HIGH o il pannello resta nero
 #define PIN_BAT       4     // partitore di misura batteria (1:2)
 
@@ -277,6 +280,17 @@ enum Page { P_RIDE, P_COST_SPEED, P_COST_BPM, P_SETUP, P_DIAG, PAGE_COUNT };
 static uint8_t page = P_RIDE;
 static bool backlightOn = true;
 static bool freezeDraw = false;   // usato dal test 'r'/'v'/'k' per non sovrascrivere il colore
+static bool trainingMode = false; // le pagine COST sono visibili solo in modalita' allenamento
+static uint32_t bootTime = 0;     // usato per ignorare i tasti nei primi istanti dopo il boot
+
+// pagina successiva/precedente saltando quelle nascoste
+static uint8_t advancePage(uint8_t p, int dir) {
+  for (int k = 0; k < PAGE_COUNT; k++) {
+    p = (uint8_t)((p + dir + PAGE_COUNT) % PAGE_COUNT);
+    if (trainingMode || (p != P_COST_SPEED && p != P_COST_BPM)) return p;
+  }
+  return p;
+}
 
 // ---------------------------------------------------------------- allenamento (soglie e target)
 // Soglie cardiache = limiti Z1|Z2, Z2|Z3, Z3|Z4, Z4|Z5 (bpm).
@@ -881,7 +895,6 @@ static void updateCostBpm() {
 
 // --- SETUP SOGLIE
 static int srX, srY, srW, srH;      // geometria della riga corrente (evita tipi custom nelle firme)
-
 static void setupRowRect(int i) {
   if (portrait) {
     srX = 4; srY = HDR_H + 6 + i * 46; srW = W - 8; srH = 42;
@@ -1034,11 +1047,10 @@ static void saveSettings() {
   prefs.putBytes("zoneLim", zoneLim, sizeof(zoneLim));
   prefs.putFloat("tgtSpeed", targetSpeed);
   prefs.putInt("tgtHr", targetHr);
-  prefs.putUChar("page", page);
   prefs.end();
 #if SERIAL_DEBUG
-  Serial.printf("NVS salvata: limite=%d tgtSpeed=%.1f tgtHr=%d page=%d\n",
-                zoneLim[setupField], targetSpeed, targetHr, page + 1);
+  Serial.printf("NVS salvata: limite=%d tgtSpeed=%.1f tgtHr=%d\n",
+                zoneLim[setupField], targetSpeed, targetHr);
 #endif
 }
 
@@ -1047,9 +1059,9 @@ static void loadSettings() {
   if (prefs.isKey("zoneLim")) prefs.getBytes("zoneLim", zoneLim, sizeof(zoneLim));
   targetSpeed = prefs.getFloat("tgtSpeed", targetSpeed);
   targetHr    = prefs.getInt("tgtHr", targetHr);
-  page        = prefs.getUChar("page", page);
   prefs.end();
-  if (page >= PAGE_COUNT) page = P_RIDE;
+  page = P_RIDE;                 // si parte sempre dalla pagina RIDE
+  trainingMode = false;
   for (int i = 1; i < N_ZLIM; i++) if (zoneLim[i] <= zoneLim[i - 1]) zoneLim[i] = zoneLim[i - 1] + 1;
 }
 
@@ -1151,7 +1163,7 @@ static void onPageShort() {
     drawFull();
     return;
   }
-  page = (page + 1) % pageCount;
+  page = advancePage(page, +1);
   saveSettings();
   drawFull();
 #if SERIAL_DEBUG
@@ -1168,6 +1180,47 @@ static void onPageLong() {
 }
 
 static void handleButtons() {
+  // I primi istanti dopo il boot i pin dei tasti non sono assestati (GPIO0 e'
+  // anche pin di strapping): ignorali, altrimenti sfoglia le pagine da solo.
+  if (millis() - bootTime < BUTTON_GUARD_MS) {
+    btn1.last = digitalRead(btn1.pin);
+    btn1.longFired = false;
+    btn2.last = digitalRead(btn2.pin);
+    btn2.longFired = false;
+    return;
+  }
+
+  bool s1 = digitalRead(btn1.pin);
+  bool s2 = digitalRead(btn2.pin);
+
+  // --- entrambi i tasti premuti per >1 s: mostra/nascondi la modalita' allenamento
+  static uint32_t bothSince = 0;
+  static bool bothFired = false;
+  if (s1 == LOW && s2 == LOW) {
+    if (bothSince == 0) bothSince = millis();
+    if (!bothFired && millis() - bothSince > 1000) {
+      bothFired = true;
+      trainingMode = !trainingMode;
+      page = trainingMode ? P_COST_SPEED : P_RIDE;
+#if SERIAL_DEBUG
+      Serial.printf("modalita' allenamento %s\n", trainingMode ? "ON" : "OFF");
+#endif
+      invalidateCache();
+      drawFull();
+    }
+    // durante la doppia pressione le azioni dei singoli tasti sono soppresse
+    btn1.last = s1; btn1.longFired = true;
+    btn2.last = s2; btn2.longFired = true;
+    return;
+  }
+  if (bothSince != 0) {          // rilascio dopo la doppia pressione: nessuna azione
+    bothSince = 0;
+    bothFired = false;
+    btn1.last = HIGH; btn1.longFired = true;
+    btn2.last = HIGH; btn2.longFired = true;
+    return;
+  }
+
   // tasto SET ("sinistro")
   bool n1 = digitalRead(btn1.pin);
   if (n1 == LOW && btn1.last == HIGH) {
@@ -1179,7 +1232,7 @@ static void handleButtons() {
     onSetLong();
   }
   if (n1 == HIGH && btn1.last == LOW) {
-    if (!btn1.longFired && millis() - btn1.tDown > 30) onSetShort();
+    if (!btn1.longFired && millis() - btn1.tDown > DEBOUNCE_MS) onSetShort();
   }
   btn1.last = n1;
 
@@ -1194,7 +1247,7 @@ static void handleButtons() {
     onPageLong();
   }
   if (n2 == HIGH && btn2.last == LOW) {
-    if (!btn2.longFired && millis() - btn2.tDown > 30) onPageShort();
+    if (!btn2.longFired && millis() - btn2.tDown > DEBOUNCE_MS) onPageShort();
   }
   btn2.last = n2;
 }
@@ -1213,6 +1266,9 @@ void setup() {
 
   pinMode(PIN_BTN1, INPUT_PULLUP);
   pinMode(PIN_BTN2, INPUT_PULLUP);
+  btn1.last = digitalRead(btn1.pin);
+  btn2.last = digitalRead(btn2.pin);
+  bootTime = millis();
 
   // batteria: partitore 1:2, attenuazione massima per arrivare a ~4,2 V
   analogSetPinAttenuation(PIN_BAT, ADC_11db);
@@ -1322,14 +1378,14 @@ void loop() {
     int c = Serial.read();
     if (c == 'n') {
       freezeDraw = false;
-      page = (page + 1) % pageCount;
+      page = advancePage(page, +1);
 #if SERIAL_DEBUG
       Serial.printf("pagina -> %d/%d\n", page + 1, pageCount);
 #endif
       drawFull();
     } else if (c == 'p') {
       freezeDraw = false;
-      page = (page + pageCount - 1) % pageCount;
+      page = advancePage(page, -1);
 #if SERIAL_DEBUG
       Serial.printf("pagina -> %d/%d\n", page + 1, pageCount);
 #endif
@@ -1347,6 +1403,15 @@ void loop() {
       setupField = (setupField + 1) % N_ZLIM;
       invalidateCache();
       drawFull();
+    } else if (c == 'a') {
+      // test: attiva/disattiva la modalita' allenamento
+      trainingMode = !trainingMode;
+      page = trainingMode ? P_COST_SPEED : P_RIDE;
+      invalidateCache();
+      drawFull();
+#if SERIAL_DEBUG
+      Serial.printf("modalita' allenamento %s\n", trainingMode ? "ON" : "OFF");
+#endif
     } else if (c == 'r' || c == 'v' || c == 'k') {
       // test diretto sul pannello, senza passare dallo sprite
       uint16_t col = (c == 'r') ? TFT_RED : (c == 'v') ? TFT_GREEN : TFT_BLACK;
