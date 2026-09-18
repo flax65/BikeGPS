@@ -2265,7 +2265,7 @@ static void taskSerial() {
 struct TaskDef { const char *name; uint32_t periodMs; uint32_t last; void (*fn)(); };
 static TaskDef sched[] = {
   {"buttons",    10, 0, handleButtons},
-  {"hr",         50, 0, hrTask},
+  {"hr",          5, 0, hrTask},
   {"serial",     20, 0, taskSerial},
   {"display",   500, 0, taskDisplay},
   {"sim",       250, 0, taskSim},
