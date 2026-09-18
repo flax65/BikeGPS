@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="108" height="108" viewBox="0 0 108 108">
+  <!-- Bicicletta -->
+  <g fill="none" stroke="#7AA2F7" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="36" cy="69" r="10.5"/>
+    <circle cx="72" cy="69" r="10.5"/>
+    <path d="M36,69 L53,70"/>
+    <path d="M36,69 L47,55"/>
+    <path d="M53,70 L47,55"/>
+    <path d="M53,70 L66,56"/>
+    <path d="M47,55 L66,56"/>
+    <path d="M66,56 L72,69"/>
+    <path d="M44,54 L50,54"/>
+    <path d="M63,53 L69,53"/>
+  </g>
+  <!-- Pin GPS -->
+  <path d="M54,26 C58.4,26 62,29.6 62,34 C62,39.5 54,48 54,48 C54,48 46,39.5 46,34 C46,29.6 49.6,26 54,26 Z" fill="#9ECE6A"/>
+  <circle cx="54" cy="34" r="3.2" fill="#00000000"/>
+</svg>
