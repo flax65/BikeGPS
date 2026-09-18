@@ -866,7 +866,7 @@ static void updateCostBpm() {
   bool g = gpsLive() || tel.lastRx != 0;
   if (g) snprintf(info, sizeof(info), "%.1f km/h  %s  %.2f km", tel.spd,
                   (zone >= 0) ? ZONE_NAMES[zone] : "--", tel.dst);
-  else   strcpy(info, "nessun dato cintura");
+  else   strcpy(info, "no GPS (app non collegata)");
   if (strcmp(info, lastInfo) != 0) {
     drawInfoRow(info);
     strncpy(lastInfo, info, sizeof(lastInfo) - 1);
