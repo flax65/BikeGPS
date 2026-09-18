@@ -153,11 +153,7 @@ static NimBLEClient *hrClient = nullptr;
 static NimBLEAddress hrAddress;
 static volatile bool hrFound = false;
 static uint32_t hrNextTry = 0;
-
-// connect()+subscribe() sono sincroni e bloccanti: li esegue un task dedicato sul core 0,
-// cosi' il loop (core 1) non si ferma mai durante l'handshake BLE.
-static TaskHandle_t hrConnectHandle = nullptr;
-static volatile int8_t hrConnectResult = -1;   // <0 in corso, 0 fallita, 1 riuscita
+static volatile int8_t hrConnectResult = -1;   // esito dell'ultimo tentativo (<0 mai, 0 fallita, 1 ok)
 
 static void parseHeartRate(const uint8_t *d, size_t n) {
   if (n < 2) return;
@@ -197,33 +193,74 @@ class HrScanCallbacks : public NimBLEScanCallbacks {
 };
 static HrScanCallbacks hrScanCallbacks;
 
+// callback del client cardio: registra la connessione e il MOTIVO della disconnessione
+class HrClientCallbacks : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient *) override {
+#if SERIAL_DEBUG
+    Serial.println("hr: client onConnect");
+#endif
+  }
+  void onDisconnect(NimBLEClient *, int reason) override {
+#if SERIAL_DEBUG
+    Serial.printf("hr: client onDisconnect reason=0x%02X\n", reason);
+#endif
+  }
+};
+static HrClientCallbacks hrClientCb;
+
 static bool hrConnect() {
   if (hrClient == nullptr) hrClient = NimBLEDevice::createClient();
   if (hrClient == nullptr) return false;
-  if (!hrClient->connect(hrAddress)) {
+  hrClient->setClientCallbacks(&hrClientCb, false);   // false: non distruggere il client da solo
+
+  bool ok = false;
+  do {
+    if (!hrClient->connect(hrAddress)) {
+#if SERIAL_DEBUG
+      Serial.println("hrConnect: connect() fallito");
+#endif
+      break;
+    }
+    NimBLERemoteService *svc = hrClient->getService(HR_SERVICE_UUID);
+    if (svc == nullptr) {
+#if SERIAL_DEBUG
+      Serial.println("hrConnect: servizio 0x180D assente");
+#endif
+      break;
+    }
+    NimBLERemoteCharacteristic *ch = svc->getCharacteristic(HR_MEAS_UUID);
+    if (ch == nullptr) {
+#if SERIAL_DEBUG
+      Serial.println("hrConnect: characteristic 0x2A37 assente");
+#endif
+      break;
+    }
+    if (!ch->subscribe(true, hrNotify)) {
+#if SERIAL_DEBUG
+      Serial.println("hrConnect: subscribe() fallita");
+#endif
+      break;
+    }
+    // Intervallo lungo (~1 s): la Geonaute lo pretende, Android non glielo concede.
+    hrClient->updateConnParams(800, 800, 0, 600);
+    ok = true;
+  } while (0);
+
+  if (!ok) {
+    // pulizia COMPLETA: se si e' connesso a meta' il client resterebbe sporco e
+    // i tentativi successivi fallirebbero per sempre. Sempre client nuovo.
     NimBLEDevice::deleteClient(hrClient);
     hrClient = nullptr;
-    return false;
   }
-  NimBLERemoteService *svc = hrClient->getService(HR_SERVICE_UUID);
-  if (svc == nullptr) { hrClient->disconnect(); return false; }
-  NimBLERemoteCharacteristic *ch = svc->getCharacteristic(HR_MEAS_UUID);
-  if (ch == nullptr) { hrClient->disconnect(); return false; }
-  if (!ch->subscribe(true, hrNotify)) { hrClient->disconnect(); return false; }
-
-  // Intervallo lungo (~1 s): la Geonaute lo pretende, Android non glielo concede.
-  hrClient->updateConnParams(800, 800, 0, 600);
-  return true;
+  return ok;
 }
 
-// Connessione fuori dal loop: attende la richiesta, connette, pubblica l'esito.
-static void hrConnectWorker(void *param) {
-  (void)param;
-  for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    hrConnectResult = hrConnect() ? 1 : 0;
-    ulTaskNotifyTake(pdTRUE, 0);   // scarta eventuali richieste accodate nel frattempo
-  }
+// transizione di stato con log: rende leggibile la storia nel monitor seriale
+static void hrStateTo(int s, const char *why) {   // int: i prototipi auto-generati di Arduino
+#if SERIAL_DEBUG                                     // stanno prima della definizione di HrState
+  Serial.printf("hr: %d -> %d (%s)\n", (int)hrState, s, why);
+#endif
+  hrState = (HrState)s;
 }
 
 static void hrTask() {
@@ -231,7 +268,7 @@ static void hrTask() {
     case HR_IDLE:
       if (millis() >= hrNextTry) {
         hrFound = false;
-        hrState = HR_SCANNING;
+        hrStateTo(HR_SCANNING, "avvio scansione");
       }
       break;
 
@@ -244,23 +281,20 @@ static void hrTask() {
       }
       if (hrFound) {
         scan->stop();
-        hrConnectResult = -1;
-        xTaskNotifyGive(hrConnectHandle);   // connect sul core 0, il loop resta libero
-        hrState = HR_CONNECTING;
+        hrStateTo(HR_CONNECTING, "fascia trovata");
       }
       break;
     }
 
     case HR_CONNECTING:
-      if (hrConnectResult < 0) break;       // handshake in corso: non bloccare il loop
+      // Connessione NEL LOOP, come nella versione che funzionava.
+      // (connect+subscribe sono sincroni: il display si ferma per la durata)
+      hrConnectResult = hrConnect() ? 1 : 0;
       if (hrConnectResult > 0) {
-        hrState = HR_READY;
-#if SERIAL_DEBUG
-        Serial.println("cardio pronto");
-#endif
+        hrStateTo(HR_READY, "connesso");
       } else {
         hrNextTry = millis() + 5000;
-        hrState = HR_IDLE;
+        hrStateTo(HR_IDLE, "connessione fallita");
       }
       break;
 
@@ -272,7 +306,7 @@ static void hrTask() {
         }
         tel.hr = 0;
         hrNextTry = millis() + 2000;
-        hrState = HR_IDLE;
+        hrStateTo(HR_IDLE, "disconnesso");
       }
       break;
   }
@@ -1521,9 +1555,6 @@ void setup() {
   adv->enableScanResponse(true);
   adv->start();
 
-  // connessione cardio su task dedicato (core 0): il connect BLE non blocca il loop
-  xTaskCreatePinnedToCore(hrConnectWorker, "hrConnect", 4096, nullptr, 1, &hrConnectHandle, 0);
-
 #if SERIAL_DEBUG
   Serial.println("BikeGPS pronto, in attesa del telefono");
 #endif
@@ -1722,6 +1753,14 @@ static void taskSerial() {
       Serial.printf("scheduler: esecuzioni=%lu jitterMax=%lu ms | hrConnect=%d\n",
                     (unsigned long)schedRuns, (unsigned long)schedMaxJitter, (int)hrConnectResult);
       schedMaxJitter = 0;
+    }
+    else if (c == 'h') {
+      // diagnostica cardio: stato della macchina, client, ultimo battito
+      Serial.printf("hr: state=%d found=%d client=%p result=%d bpm=%d eta=%lums live=%d acq=%d scan=%d\n",
+                    (int)hrState, (int)hrFound, (void *)hrClient, (int)hrConnectResult,
+                    tel.hr, (unsigned long)(tel.hrLastRx ? millis() - tel.hrLastRx : 0),
+                    (int)hrLive(), (int)hrAcquiring(),
+                    (int)NimBLEDevice::getScan()->isScanning());
     }
     else if (c == 'c') {
       // test: simula una fascia trovata a un indirizzo inesistente. La richiesta
