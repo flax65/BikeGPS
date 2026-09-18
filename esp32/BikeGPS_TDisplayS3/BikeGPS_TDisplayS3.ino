@@ -337,6 +337,7 @@ static char lastHeader[32];
 static uint16_t lastHeaderCol = 0;
 // cache delle pagine di allenamento
 static char lastTgt[24], lastHeroC[24], lastDev[24], lastInfo[40], lastTime[24];
+static uint16_t lastHeroCCol = 0;   // colore dell'hero (cambia senza che cambi il testo)
 static int  lastZoneShown = -9;
 // cache della pagina SETUP
 static int lastSetupField = -1;
@@ -350,6 +351,7 @@ static void invalidateCache() {
   lastHeader[0] = 0;
   lastHeaderCol = 0;
   lastTgt[0] = lastHeroC[0] = lastDev[0] = lastInfo[0] = lastTime[0] = 0;
+  lastHeroCCol = 0;
   lastZoneShown = -9;
   lastSetupField = -1;
   for (int i = 0; i < N_ZLIM; i++) lastSetupVal[i] = -1;
@@ -703,33 +705,67 @@ static void updateZoneBar(int x, int y, int w, int h, int active) {
   tft.setTextDatum(TL_DATUM);
 }
 
-// barra centrata sul target: cursore = scostamento, banda chiara = tolleranza
-static void drawDevBar(int x, int y, int w, int h, float dev, float range, float toll) {
+// --- barra deviazione: pannello + banda disegnati UNA volta, poi si muove solo il cursore
+static int dbX, dbY, dbW, dbH, dbCx, dbHalf, dbTw;
+static int dbPx = 0x7FFFFFFF;   // ultima posizione del cursore (sentinel = mai disegnato)
+
+static void layoutDevBar(int x, int y, int w, int h, float range, float toll) {
+  dbX = x; dbY = y; dbW = w; dbH = h;
   tft.fillRect(x, y, w, h, C_PANEL);
   tft.drawRect(x, y, w, h, C_BORDER);
-  int cx = x + w / 2;
-  int half = w / 2 - 3;
-  int tw = (int)(toll / range * half);
-  if (tw > 0) tft.fillRect(cx - tw, y + 1, tw * 2, h - 2, tft.color565(0x1e, 0x3a, 0x2a));
-  tft.drawFastVLine(cx, y + 1, h - 2, C_FG);
+  dbCx = x + w / 2;
+  dbHalf = w / 2 - 3;
+  dbTw = (int)(toll / range * dbHalf);
+  if (dbTw > 0) tft.fillRect(dbCx - dbTw, y + 1, dbTw * 2, h - 2, tft.color565(0x1e, 0x3a, 0x2a));
+  tft.drawFastVLine(dbCx, y + 1, h - 2, C_FG);
+  tft.fillRect(dbCx - 2, y + 1, 5, h - 2, C_GREEN);   // cursore a centro (deviazione 0)
+  dbPx = dbCx;
+}
+
+// Ridisegna SOLO il tratto fra vecchio e nuovo cursore (entrambi i segmenti partono dal centro).
+static void updateDevBar(float dev, float range, float toll) {
   float k = dev / range;
   if (k > 1) k = 1;
   if (k < -1) k = -1;
-  int px = cx + (int)(k * half);
+  int px = dbCx + (int)(k * dbHalf);
+  if (px == dbPx) return;
+
+  int c0 = min(dbPx, px); if (c0 > dbCx) c0 = dbCx;
+  int c1 = max(dbPx, px); if (c1 < dbCx) c1 = dbCx;
+  c0 -= 3; c1 += 3;                       // il cursore e' largo 5 px
+  if (c0 < dbX + 1) c0 = dbX + 1;
+  if (c1 > dbX + dbW - 1) c1 = dbX + dbW - 1;
+
+  tft.fillRect(c0, dbY + 1, c1 - c0, dbH - 2, C_PANEL);
+  if (dbTw > 0) {
+    int b0 = dbCx - dbTw, b1 = dbCx + dbTw;
+    if (b0 < c0) b0 = c0;
+    if (b1 > c1) b1 = c1;
+    if (b1 > b0) tft.fillRect(b0, dbY + 1, b1 - b0, dbH - 2, tft.color565(0x1e, 0x3a, 0x2a));
+  }
+  tft.drawFastVLine(dbCx, dbY + 1, dbH - 2, C_FG);
+
   float a = fabs(dev);
   uint16_t col = (a <= toll) ? C_GREEN : (a <= 2 * toll ? C_YELLOW : C_RED);
-  if (px != cx) tft.fillRect((px < cx ? px : cx), y + 3, (px < cx ? cx - px : px - cx), h - 6, col);
-  tft.fillRect(px - 2, y + 1, 5, h - 2, col);
+  int s0 = min(dbCx, px), s1 = max(dbCx, px);
+  if (s1 > s0) tft.fillRect(s0, dbY + 3, s1 - s0, dbH - 6, col);
+  tft.fillRect(px - 2, dbY + 1, 5, dbH - 2, col);
+  dbPx = px;
 }
 
-// riga del target: etichetta a sinistra, valore a destra
-static void drawTargetRow(const char *label, const char *value, uint16_t col) {
+// riga del target: pannello + etichetta una volta, valore a ogni cambio
+static void layoutTargetRow(const char *label) {
   int r_x = R_TGT.x, r_y = R_TGT.y, r_w = R_TGT.w, r_h = R_TGT.h;
   tft.fillRoundRect(r_x, r_y, r_w, r_h, 6, C_PANEL);
   tft.drawRoundRect(r_x, r_y, r_w, r_h, 6, C_BORDER);
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(C_DIM, C_PANEL);
   tft.drawString(label, r_x + 8, r_y + r_h / 2, 2);
+  tft.setTextDatum(TL_DATUM);
+}
+
+static void updateTargetValue(const char *value, uint16_t col) {
+  int r_x = R_TGT.x, r_y = R_TGT.y, r_w = R_TGT.w, r_h = R_TGT.h;
   tft.setTextDatum(MR_DATUM);
   tft.setTextColor(col, C_PANEL);
   tft.setTextPadding(r_w / 2 + 8);
@@ -738,16 +774,11 @@ static void drawTargetRow(const char *label, const char *value, uint16_t col) {
   tft.setTextDatum(TL_DATUM);
 }
 
-// valore gigante + unita'
-static void drawCostHero(const char *value, const char *unit, uint16_t col) {
+// valore gigante: pannello + unita' una volta, numero a ogni cambio
+static void layoutCostHero(const char *unit) {
   int r_x = R_HERO.x, r_y = R_HERO.y, r_w = R_HERO.w, r_h = R_HERO.h;
   tft.fillRoundRect(r_x, r_y, r_w, r_h, 6, C_PANEL);
   tft.drawRoundRect(r_x, r_y, r_w, r_h, 6, C_BORDER);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(col, C_PANEL);
-  tft.setTextPadding(r_w - 10);
-  tft.drawString(value, r_x + r_w / 2, r_y + r_h / 2 - 8, 7);
-  tft.setTextPadding(0);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(C_DIM, C_PANEL);
   tft.setTextPadding(60);
@@ -755,10 +786,24 @@ static void drawCostHero(const char *value, const char *unit, uint16_t col) {
   tft.setTextPadding(0);
 }
 
-static void drawInfoRow(const char *s) {
+static void updateCostHeroValue(const char *value, uint16_t col) {
+  int r_x = R_HERO.x, r_y = R_HERO.y, r_w = R_HERO.w, r_h = R_HERO.h;
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(col, C_PANEL);
+  tft.setTextPadding(r_w - 10);
+  tft.drawString(value, r_x + r_w / 2, r_y + r_h / 2 - 8, 7);
+  tft.setTextPadding(0);
+  tft.setTextDatum(TL_DATUM);
+}
+
+static void layoutInfoRow() {
   int r_x = R_INFO.x, r_y = R_INFO.y, r_w = R_INFO.w, r_h = R_INFO.h;
   tft.fillRoundRect(r_x, r_y, r_w, r_h, 6, C_PANEL);
   tft.drawRoundRect(r_x, r_y, r_w, r_h, 6, C_BORDER);
+}
+
+static void updateInfoValue(const char *s) {
+  int r_x = R_INFO.x, r_y = R_INFO.y, r_w = R_INFO.w, r_h = R_INFO.h;
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(C_FG, C_PANEL);
   tft.setTextPadding(r_w - 12);
@@ -790,11 +835,15 @@ static void layoutCostSpeed() {
   invalidateCache();
   drawHeaderStatic();
   costGeometry();
-  drawTargetRow("TARGET", "--", C_GREEN);
+  layoutTargetRow("TARGET");
   layoutZoneBar(R_ZBAR.x, R_ZBAR.y, R_ZBAR.w, R_ZBAR.h);
-  drawCostHero("--", "km/h", C_FG);
-  drawInfoRow("--");
+  layoutCostHero("km/h");
+  layoutDevBar(R_DEVBR.x, R_DEVBR.y, R_DEVBR.w, R_DEVBR.h, DEV_RANGE_SPEED, TOLL_SPEED);
+  layoutInfoRow();
   drawTimeRow("in target --:--:--");
+  updateTargetValue("--", C_GREEN);
+  updateCostHeroValue("--", C_FG);
+  updateInfoValue("--");
 }
 
 static void updateCostSpeed() {
@@ -804,7 +853,7 @@ static void updateCostSpeed() {
 
   snprintf(tgt, sizeof(tgt), "%.1f km/h", targetSpeed);
   if (strcmp(tgt, lastTgt) != 0) {
-    drawTargetRow("TARGET", tgt, C_GREEN);
+    updateTargetValue(tgt, C_GREEN);
     strncpy(lastTgt, tgt, sizeof(lastTgt) - 1);
   }
 
@@ -816,9 +865,11 @@ static void updateCostSpeed() {
   float d = tel.spd - targetSpeed;
   bool inT = live && fabs(d) <= TOLL_SPEED;
   if (live) snprintf(hero, sizeof(hero), "%.1f", tel.spd); else strcpy(hero, "-.-");
-  if (strcmp(hero, lastHeroC) != 0) {
-    drawCostHero(hero, "km/h", !live ? C_DIM : (inT ? C_GREEN : C_FG));
+  uint16_t hcol = !live ? C_DIM : (inT ? C_GREEN : C_FG);
+  if (strcmp(hero, lastHeroC) != 0 || hcol != lastHeroCCol) {
+    updateCostHeroValue(hero, hcol);
     strncpy(lastHeroC, hero, sizeof(lastHeroC) - 1);
+    lastHeroCCol = hcol;
   }
 
   if (live) snprintf(dev, sizeof(dev), "%c  %+.1f km/h", inT ? '=' : (d > 0 ? '^' : 'v'), d);
@@ -833,8 +884,8 @@ static void updateCostSpeed() {
     tft.setTextPadding(0);
     tft.setTextDatum(TL_DATUM);
     strncpy(lastDev, dev, sizeof(lastDev) - 1);
-    drawDevBar(R_DEVBR.x, R_DEVBR.y, R_DEVBR.w, R_DEVBR.h, live ? d : 0, DEV_RANGE_SPEED, TOLL_SPEED);
   }
+  updateDevBar(live ? d : 0, DEV_RANGE_SPEED, TOLL_SPEED);
 
   if (live) {
     char hrb[12];
@@ -843,7 +894,7 @@ static void updateCostSpeed() {
              (zone >= 0) ? ZONE_NAMES[zone] : "--", tel.dst);
   } else strcpy(info, "nessun dato GPS");
   if (strcmp(info, lastInfo) != 0) {
-    drawInfoRow(info);
+    updateInfoValue(info);
     strncpy(lastInfo, info, sizeof(lastInfo) - 1);
   }
 
@@ -860,11 +911,15 @@ static void layoutCostBpm() {
   invalidateCache();
   drawHeaderStatic();
   costGeometry();
-  drawTargetRow("TARGET", "--", C_RED);
+  layoutTargetRow("TARGET");
   layoutZoneBar(R_ZBAR.x, R_ZBAR.y, R_ZBAR.w, R_ZBAR.h);
-  drawCostHero("--", "bpm", C_RED);
-  drawInfoRow("--");
+  layoutCostHero("bpm");
+  layoutDevBar(R_DEVBR.x, R_DEVBR.y, R_DEVBR.w, R_DEVBR.h, DEV_RANGE_HR, TOLL_HR);
+  layoutInfoRow();
   drawTimeRow("in target --:--:--");
+  updateTargetValue("--", C_RED);
+  updateCostHeroValue("--", C_FG);
+  updateInfoValue("--");
 }
 
 static void updateCostBpm() {
@@ -874,7 +929,7 @@ static void updateCostBpm() {
 
   snprintf(tgt, sizeof(tgt), "%d bpm", targetHr);
   if (strcmp(tgt, lastTgt) != 0) {
-    drawTargetRow("TARGET", tgt, C_RED);
+    updateTargetValue(tgt, C_RED);
     strncpy(lastTgt, tgt, sizeof(lastTgt) - 1);
   }
 
@@ -886,9 +941,11 @@ static void updateCostBpm() {
   int d = tel.hr - targetHr;
   bool inT = live && abs(d) <= TOLL_HR;
   if (live) snprintf(hero, sizeof(hero), "%d", tel.hr); else strcpy(hero, "--");
-  if (strcmp(hero, lastHeroC) != 0) {
-    drawCostHero(hero, "bpm", !live ? C_DIM : zoneColor(zone));
+  uint16_t hcol = !live ? C_DIM : zoneColor(zone);
+  if (strcmp(hero, lastHeroC) != 0 || hcol != lastHeroCCol) {
+    updateCostHeroValue(hero, hcol);
     strncpy(lastHeroC, hero, sizeof(lastHeroC) - 1);
+    lastHeroCCol = hcol;
   }
 
   if (live) snprintf(dev, sizeof(dev), "%c  %+d bpm", inT ? '=' : (d > 0 ? '^' : 'v'), d);
@@ -903,15 +960,15 @@ static void updateCostBpm() {
     tft.setTextPadding(0);
     tft.setTextDatum(TL_DATUM);
     strncpy(lastDev, dev, sizeof(lastDev) - 1);
-    drawDevBar(R_DEVBR.x, R_DEVBR.y, R_DEVBR.w, R_DEVBR.h, live ? (float)d : 0, DEV_RANGE_HR, TOLL_HR);
   }
+  updateDevBar(live ? (float)d : 0, DEV_RANGE_HR, TOLL_HR);
 
   bool g = gpsLive() || tel.lastRx != 0;
   if (g) snprintf(info, sizeof(info), "%.1f km/h  %s  %.2f km", tel.spd,
                   (zone >= 0) ? ZONE_NAMES[zone] : "--", tel.dst);
   else   strcpy(info, "no GPS (app non collegata)");
   if (strcmp(info, lastInfo) != 0) {
-    drawInfoRow(info);
+    updateInfoValue(info);
     strncpy(lastInfo, info, sizeof(lastInfo) - 1);
   }
 
@@ -1119,6 +1176,14 @@ static void printStatus() {
 #endif
 }
 
+// Dopo un cambio di target: NON ridisegnare lo schermo intero.
+// Basta forzare la riga TARGET e lasciare che la cache aggiorni solo cio' che e' cambiato
+// (hero, dev, barra di deviazione).
+static void refreshTarget() {
+  lastTgt[0] = 0;
+  drawValues();
+}
+
 // --- tasto SET (sinistro): pressione corta
 static void onSetShort() {
   bool changed = false;
@@ -1126,13 +1191,15 @@ static void onSetShort() {
     case P_COST_SPEED:
       targetSpeed += TGT_SPEED_STEP;
       clampTargetSpeed(true);      // oltre 35 km/h riparte da 25
-      changed = true;
-      break;
+      saveSettings();
+      refreshTarget();
+      return;
     case P_COST_BPM:
       targetHr++;
       if (targetHr > TGT_HR_MAX) targetHr = TGT_HR_MIN;
-      changed = true;
-      break;
+      saveSettings();
+      refreshTarget();
+      return;
     case P_SETUP:
       zoneLim[setupField]++;
       if (zoneLim[setupField] > 220) zoneLim[setupField] = 220;
@@ -1161,16 +1228,14 @@ static void onSetLong() {
         targetSpeed = roundf(tel.spd * 10.0f) / 10.0f;
         clampTargetSpeed(false);     // resta nell'intervallo 25..35
         saveSettings();
-        invalidateCache();
-        drawFull();
+        refreshTarget();
       }
       break;
     case P_COST_BPM:
       if (hrLive()) {
         targetHr = tel.hr;
         saveSettings();
-        invalidateCache();
-        drawFull();
+        refreshTarget();
       }
       break;
     case P_SETUP:
@@ -1469,6 +1534,107 @@ void loop() {
 #if SERIAL_DEBUG
       Serial.printf("test pannello: fillScreen(0x%04X) colore=%c\n", col, c);
 #endif
+    }
+    else if (c == 'm') {
+      // benchmark del rendering: tempi REALI sul pannello, tutte le pagine.
+      //   fillScreen = throughput puro del bus parallelo 8 bit
+      //   drawFull   = layout + tutti i valori
+      //   warm       = nessun valore cambiato (solo controllo cache)
+      //   cold       = cache invalidata, ridisegna tutti i campi
+      uint8_t save = page;
+      Serial.printf("BENCH %s  cpu=%u MHz  bus=%u byte/pixel\n",
+                    portrait ? "verticale 170x320" : "orizzontale 320x170",
+                    (unsigned)getCpuFrequencyMhz(), 2);
+      {
+        uint32_t t0 = micros(); tft.fillScreen(C_BG); uint32_t t1 = micros();
+        uint32_t px = (uint32_t)W * H;
+        uint32_t us = t1 - t0;
+        Serial.printf("  fillScreen = %lu us su %lu px  =>  %lu ns/px  (%.2f MB/s sul bus)\n",
+                      (unsigned long)us, (unsigned long)px,
+                      (unsigned long)(us * 1000UL / px), px * 2.0f / us);
+      }
+      for (uint8_t p = 0; p < PAGE_COUNT; p++) {
+        if (p == P_SETUP) continue;      // la SETUP non si visita col giro tasti
+        page = p;
+        uint32_t t0 = micros(); tft.fillScreen(C_BG);  uint32_t t1 = micros();
+        drawFull();                                     uint32_t t2 = micros();
+        drawValues();                                   uint32_t t3 = micros();
+        invalidateCache(); drawValues();                uint32_t t4 = micros();
+        Serial.printf("  %-10s fill=%5luus  drawFull=%6luus  warm=%5luus  cold=%6luus\n",
+                      pageTitle(),
+                      (unsigned long)(t1 - t0), (unsigned long)(t2 - t1),
+                      (unsigned long)(t3 - t2), (unsigned long)(t4 - t3));
+      }
+      page = save;
+      invalidateCache();
+      drawFull();
+      Serial.println("BENCH fine");
+    }
+    else if (c == 'q') {
+      // profilo per componente: invalida UNA cache alla volta e misura drawValues().
+      uint8_t save = page;
+      uint32_t t0;
+      auto misura = [&](const char *nome) {
+        uint32_t t1 = micros();
+        Serial.printf("  %-22s = %6lu us\n", nome, (unsigned long)(t1 - t0));
+      };
+      for (uint8_t p = 0; p < PAGE_COUNT; p++) {
+        if (p == P_SETUP) continue;
+        page = p;
+        invalidateCache();
+        drawFull();
+        Serial.printf("PROFILO %s\n", pageTitle());
+        t0 = micros(); drawValues(); misura("warm (nessun cambio)");
+        if (page == P_RIDE) {
+          lastHeroVal[0] = 0;
+          t0 = micros(); drawValues(); misura("hero velocita");
+        }
+        if (page == P_RIDE || page == P_DIAG) {
+          lastVals[0][0] = 0;
+          t0 = micros(); drawValues(); misura("1 cella griglia");
+          if (page == P_DIAG) {
+            for (int i = 0; i < 8; i++) lastVals[i][0] = 0;
+            t0 = micros(); drawValues(); misura("8 celle griglia");
+          }
+        }
+        if (page == P_COST_SPEED || page == P_COST_BPM) {
+          lastTgt[0] = 0;
+          t0 = micros(); drawValues(); misura("riga TARGET");
+          lastZoneShown = -9;
+          t0 = micros(); drawValues(); misura("barra zone");
+          lastHeroC[0] = 0;
+          t0 = micros(); drawValues(); misura("hero + unita'");
+          lastDev[0] = 0;
+          t0 = micros(); drawValues(); misura("dev testo (no barra)");
+          {
+            float rg = (page == P_COST_SPEED) ? DEV_RANGE_SPEED : DEV_RANGE_HR;
+            float tl = (page == P_COST_SPEED) ? TOLL_SPEED : TOLL_HR;
+            t0 = micros();
+            for (int i = 0; i < 20; i++) updateDevBar((i & 1) ? tl : -tl, rg, tl);
+            uint32_t t1 = micros();
+            Serial.printf("  %-22s = %6lu us  (%.0f us/movimento)\n",
+                          "20x movimento barra", (unsigned long)(t1 - t0), (t1 - t0) / 20.0f);
+          }
+          lastInfo[0] = 0;
+          t0 = micros(); drawValues(); misura("riga info");
+          lastTime[0] = 0;
+          t0 = micros(); drawValues(); misura("riga tempo");
+          {
+            float sSave = targetSpeed; int hrSave = targetHr;
+            t0 = micros();
+            for (int i = 0; i < 10; i++) onSetShort();   // 10 pressioni reali del tasto SET
+            uint32_t t1 = micros();
+            Serial.printf("  %-22s = %6lu us  (%.0f us/pressione)\n",
+                          "10x tasto SET", (unsigned long)(t1 - t0), (t1 - t0) / 10.0f);
+            targetSpeed = sSave; targetHr = hrSave;
+            lastTgt[0] = 0; drawValues();
+          }
+        }
+      }
+      page = save;
+      invalidateCache();
+      drawFull();
+      Serial.println("PROFILO fine");
     }
     else if (c == 'd') {
       printStatus();
