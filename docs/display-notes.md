@@ -112,6 +112,39 @@ Nota di sviluppo: niente `enum` come parametro di funzione (l'auto-prototyping d
 Arduino mette i prototipi in cima e il tipo non è ancora dichiarato) → usare
 `#define`/`uint8_t`.
 
+### Problema risolto: black screen con il doppio buffer (sprite)
+
+**Non usare `TFT_eSprite` a tutto schermo + `pushSprite()` su questo pannello.**
+Su questa scheda il `pushSprite` manda il pannello in **black screen dopo pochi
+secondi** (il chip resta vivo e la telemetria BLE continua regolarmente, il
+backlight e `LCD_POWER_ON` restano corretti, e con `tft.fillScreen()` diretto lo
+schermo si colora benissimo: era proprio il `pushSprite`).
+
+Strategia adottata (disegno diretto, niente flicker):
+
+1. **`tft.setTextPadding(w)`** prima di `drawString`: la libreria cancella solo
+   l'area del testo invece di tutto il pannello.
+2. **Cache dei valori**: si ridisegna un campo solo se la stringa è cambiata
+   (`lastHeroVal`, `lastVals[]`, `lastHeader`), non a ogni ciclo da 250 ms.
+3. Header statico (`drawHeaderStatic`) separato dalla parte variabile
+   (`updateHeader`).
+
+### Comandi di diagnostica seriale (nello sketch)
+
+Da terminale con la seriale aperta a 115200:
+
+| Tasto | Azione |
+|---|---|
+| `n` / `p` | pagina avanti / indietro |
+| `b` | retroilluminazione on/off |
+| `s` | stampa stato (pin backlight, LCD power, heap, pagina, uptime) |
+| `d` | re-init del pannello + ridisegno della pagina |
+| `r` / `v` / `k` | `fillScreen` rosso / verde / nero (test pannello, blocca il refresh) |
+
+Esempio: `arduino-cli monitor -p /dev/ttyACM0 -c baudrate=115200` e poi premere i tasti.
+
+---
+
 ### Promemoria generali
 
 `LCD_POWER_ON` (GPIO15) va portato HIGH prima di `tft.init()`, altrimenti lo
