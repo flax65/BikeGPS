@@ -430,11 +430,24 @@ static void drawCell(int x, int y, int w, int h, const char *label, const char *
 }
 
 // intestazione statica (disegnata una volta per pagina)
+static const char *pageTitle() {
+  switch (page) {
+    case P_RIDE:       return "RIDE";
+    case P_COST_SPEED: return "COST SPEED";
+    case P_COST_BPM:   return "COST BPM";
+    case P_SETUP:      return "SETUP";
+    case P_DIAG:       return "DIAG";
+  }
+  return "BikeGPS";
+}
+
 static void drawHeaderStatic() {
   tft.fillRect(0, 0, W, HDR_H, C_BG);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(C_BLUE, C_BG);
-  tft.drawString("BikeGPS", 6, 5, 2);
+  tft.setTextPadding(W / 2);
+  tft.drawString(pageTitle(), 6, 5, 2);
+  tft.setTextPadding(0);
 }
 
 // parte variabile dell'intestazione: stato BLE + batteria (solo se cambia)
@@ -1157,14 +1170,20 @@ static void onSetLong() {
 
 // --- tasto PAGE (destro)
 static void onPageShort() {
-  if (page == P_SETUP) {            // in SETUP cambia il campo selezionato
-    setupField = (setupField + 1) % N_ZLIM;
+  if (page == P_SETUP) {            // in SETUP il tasto destro cambia il campo selezionato
+    setupField++;
+    if (setupField >= N_ZLIM) {     // dopo l'ultimo campo si passa alla pagina successiva
+      setupField = 0;
+      page = advancePage(page, +1);
+    }
     invalidateCache();
     drawFull();
+#if SERIAL_DEBUG
+    Serial.printf("setup campo %d, pagina -> %d/%d\n", setupField, page + 1, pageCount);
+#endif
     return;
   }
   page = advancePage(page, +1);
-  saveSettings();
   drawFull();
 #if SERIAL_DEBUG
   Serial.printf("pagina -> %d/%d\n", page + 1, pageCount);
@@ -1174,9 +1193,20 @@ static void onPageShort() {
 static void onPageLong() {
   if (page != P_RIDE) {             // scorciatoia: torna alla pagina RIDE
     page = P_RIDE;
-    saveSettings();
     drawFull();
   }
+}
+
+// pagina precedente (usata dal comando seriale di test)
+static void onPagePrev() {
+  if (page == P_SETUP) {
+    setupField = (setupField == 0) ? (N_ZLIM - 1) : (setupField - 1);
+    invalidateCache();
+    drawFull();
+    return;
+  }
+  page = advancePage(page, -1);
+  drawFull();
 }
 
 static void handleButtons() {
@@ -1378,18 +1408,10 @@ void loop() {
     int c = Serial.read();
     if (c == 'n') {
       freezeDraw = false;
-      page = advancePage(page, +1);
-#if SERIAL_DEBUG
-      Serial.printf("pagina -> %d/%d\n", page + 1, pageCount);
-#endif
-      drawFull();
+      onPageShort();
     } else if (c == 'p') {
       freezeDraw = false;
-      page = advancePage(page, -1);
-#if SERIAL_DEBUG
-      Serial.printf("pagina -> %d/%d\n", page + 1, pageCount);
-#endif
-      drawFull();
+      onPagePrev();
     } else if (c == 'b') setBacklight(!backlightOn);
     else if (c == 's') printStatus();
     else if (c == 't') {
