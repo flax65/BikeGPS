@@ -453,6 +453,16 @@ static void drawFitted(int x, int y, int w, const char *s, uint16_t fg, uint16_t
   tft.setTextFont(2);
 }
 
+// come drawFitted ma con cache: se testo e colore non cambiano non tocca il bus.
+// (il ramo orizzontale della RIDE lo usa per distanza/tempo/media/max)
+static void drawFittedCached(int i, int x, int y, int w, const char *s, uint16_t fg, uint16_t bg) {
+  if (strcmp(lastVals[i], s) == 0 && lastValsCol[i] == fg) return;
+  drawFitted(x, y, w, s, fg, bg);
+  strncpy(lastVals[i], s, sizeof(lastVals[i]) - 1);
+  lastVals[i][sizeof(lastVals[i]) - 1] = 0;
+  lastValsCol[i] = fg;
+}
+
 static void drawCell(int x, int y, int w, int h, const char *label, const char *value, uint16_t vc) {
   tft.fillRoundRect(x, y, w, h, 6, C_PANEL);
   tft.drawRoundRect(x, y, w, h, 6, C_BORDER);
@@ -584,19 +594,19 @@ static void updateRide() {
     return;
   }
 
-  // orizzontale
+  // orizzontale: 4 campi, con la stessa cache del resto della pagina
   const int gx = heroX + heroW + 4, gw = W - gx - 4;
   const int cy = heroY + heroH + 4, ch = H - cy - 4;
   const int cw = (heroW - 4) / 2;
   tft.setTextDatum(ML_DATUM);
   if (live) snprintf(v, sizeof(v), "%.2f", tel.dst); else strcpy(v, "--");
-  drawFitted(heroX + 8, cy + ch - 16, cw, v, C_CYAN, C_PANEL);
+  drawFittedCached(0, heroX + 8, cy + ch - 16, cw, v, C_CYAN, C_PANEL);
   if (live) fmtTime(tel.mov, v, sizeof(v)); else strcpy(v, "--");
-  drawFitted(heroX + cw + 12, cy + ch - 16, cw, v, C_CYAN, C_PANEL);
+  drawFittedCached(1, heroX + cw + 12, cy + ch - 16, cw, v, C_CYAN, C_PANEL);
   if (live) fmtAvg(v, sizeof(v)); else strcpy(v, "--");
-  drawFitted(gx + 8, heroY + (heroH - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
+  drawFittedCached(2, gx + 8, heroY + (heroH - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
   if (live) snprintf(v, sizeof(v), "%.1f", tel.mx); else strcpy(v, "--");
-  drawFitted(gx + 8, heroY + (heroH - 4) / 2 + 4 + (heroH - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
+  drawFittedCached(3, gx + 8, heroY + (heroH - 4) / 2 + 4 + (heroH - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
   tft.setTextDatum(TL_DATUM);
 }
 
@@ -1170,6 +1180,16 @@ static void loadSettings() {
   for (int i = 1; i < N_ZLIM; i++) if (zoneLim[i] <= zoneLim[i - 1]) zoneLim[i] = zoneLim[i - 1] + 1;
 }
 
+// Salvataggio NVS RITARDATO: il tasto non scrive piu' in flash ad ogni pressione.
+// Un task a 1 Hz salva solo se i valori sono cambiati e nessuno li tocca da 1 s.
+static bool settingsDirty = false;
+static uint32_t settingsDirtyAt = 0;
+
+static void markSettingsDirty() {
+  settingsDirty = true;
+  settingsDirtyAt = millis();
+}
+
 // ---------------------------------------------------------------- pulsanti
 struct Button { uint8_t pin; bool last; uint32_t tDown; bool longFired; };
 static Button btn1 = {BTN_SET,  HIGH, 0, false};
@@ -1209,13 +1229,13 @@ static void onSetShort() {
     case P_COST_SPEED:
       targetSpeed += TGT_SPEED_STEP;
       clampTargetSpeed(true);      // oltre 35 km/h riparte da 25
-      saveSettings();
+      markSettingsDirty();
       refreshTarget();
       return;
     case P_COST_BPM:
       targetHr++;
       if (targetHr > TGT_HR_MAX) targetHr = TGT_HR_MIN;
-      saveSettings();
+      markSettingsDirty();
       refreshTarget();
       return;
     case P_SETUP:
@@ -1232,7 +1252,7 @@ static void onSetShort() {
     Serial.printf("set: tgtSpeed=%.1f tgtHr=%d zoneLim=%d,%d,%d,%d\n",
                   targetSpeed, targetHr, zoneLim[0], zoneLim[1], zoneLim[2], zoneLim[3]);
 #endif
-    saveSettings();
+    markSettingsDirty();
     invalidateCache();
     drawFull();
   }
@@ -1245,14 +1265,14 @@ static void onSetLong() {
       if (gpsLive() || tel.lastRx != 0) {
         targetSpeed = roundf(tel.spd * 10.0f) / 10.0f;
         clampTargetSpeed(false);     // resta nell'intervallo 25..35
-        saveSettings();
+        markSettingsDirty();
         refreshTarget();
       }
       break;
     case P_COST_BPM:
       if (hrLive()) {
         targetHr = tel.hr;
-        saveSettings();
+        markSettingsDirty();
         refreshTarget();
       }
       break;
@@ -1260,7 +1280,7 @@ static void onSetLong() {
       zoneLim[setupField]--;
       if (zoneLim[setupField] < 60) zoneLim[setupField] = 60;
       for (int i = N_ZLIM - 1; i > 0; i--) if (zoneLim[i - 1] > zoneLim[i] - 1) zoneLim[i - 1] = zoneLim[i] - 1;
-      saveSettings();
+      markSettingsDirty();
       invalidateCache();
       drawFull();
       break;
@@ -1505,6 +1525,12 @@ static void taskDisplay() {                 // 4 Hz: ridisegna solo i valori cam
   if (!freezeDraw) drawValues();
 }
 
+static void taskSaveSettings() {            // 1 Hz: salva in flash solo se serve
+  if (!settingsDirty || millis() - settingsDirtyAt < 1000) return;
+  saveSettings();
+  settingsDirty = false;
+}
+
 // comandi di test da seriale: n = pagina avanti, p = indietro, b = retroilluminazione
 //   d = riaccendi + ridisegna, s = stato pin/heap
 //   r = schermo rosso pieno (test pannello diretto), v = verde, k = nero
@@ -1689,6 +1715,7 @@ static TaskDef sched[] = {
   {"hr",         50, 0, hrTask},
   {"serial",     20, 0, taskSerial},
   {"display",   250, 0, taskDisplay},
+  {"nvs",      1000, 0, taskSaveSettings},
   {"battery",  1000, 0, taskBattery},
   {"target",   1000, 0, taskTargetTime},
 };
