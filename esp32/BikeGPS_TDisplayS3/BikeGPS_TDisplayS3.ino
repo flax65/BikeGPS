@@ -39,6 +39,7 @@
 #include <TFT_eSPI.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>   // soglie e target salvati in flash (NVS)
+#include "vlw_fonts.h"      // font VLW antialiased generati (16/26/48 px)
 
 // ---------------------------------------------------------------- pin scheda
 #define PIN_BTN1      0     // pulsante integrato ("sinistro"): modifica i valori
@@ -55,11 +56,18 @@
 
 #define SERIAL_DEBUG 1
 
-#define ROTATION 0          // 0/2 = verticale, 1/3 = orizzontale (cambia il verso)
+#define ROTATION 1          // 0/2 = verticale, 1/3 = orizzontale (cambia il verso)
 
 // Rendering della velocita' nel riquadro RIDE:
 //   0 = font bitmap di TFT_eSPI (bello, ma dimensione fissa)
 //   1 = 7 segmenti vettoriale (scalabile, ma estetica "a rettangoli")
+// Simulazione delle grandezze (velocita'/cadenza/watt) attiva all'avvio:
+// comoda in fase di test, da mettere a 0 a fine sviluppo. Si comanda anche col tasto 'y'.
+// Parametri di connessione cardio: 1 = 800/800/0/600 (come sul vecchio ESP32), 0 = non toccarli
+#define HR_CONN_PARAMS 1
+
+#define SIM_DEFAULT_ON 1
+
 #define HERO_RENDER_SEG 0
 #define HDR_H 26            // altezza della riga di stato in alto
 
@@ -94,6 +102,10 @@ struct Telemetry {
   int      hr = 0;       // bpm
   bool     hrContact = false;
   uint32_t hrLastRx = 0;
+
+  // sensori BLE futuri: cadenza (CSC 0x1816) e potenza (CPS 0x1818)
+  int      cad = 0;      // rpm
+  int      pw = 0;       // W
 } tel;
 
 struct __attribute__((packed)) TelemetryPacket {
@@ -158,6 +170,7 @@ static NimBLEClient *hrClient = nullptr;
 static NimBLEAddress hrAddress;
 static volatile bool hrFound = false;
 static uint32_t hrNextTry = 0;
+static uint32_t hrReadyAt = 0;   // millis del passaggio a HR_READY
 static volatile int8_t hrConnectResult = -1;   // esito dell'ultimo tentativo (<0 mai, 0 fallita, 1 ok)
 
 static void parseHeartRate(const uint8_t *d, size_t n) {
@@ -194,6 +207,12 @@ class HrScanCallbacks : public NimBLEScanCallbacks {
                     dev->getAddress().toString().c_str());
 #endif
     }
+#if SERIAL_DEBUG
+    else if (dev->haveName()) {     // log degli altri device visti (diagnostica scansione)
+      Serial.printf("scan: %s [%s] rssi=%d\n", dev->getName().c_str(),
+                    dev->getAddress().toString().c_str(), dev->getRSSI());
+    }
+#endif
   }
 };
 static HrScanCallbacks hrScanCallbacks;
@@ -259,8 +278,11 @@ static bool hrConnect() {
 #endif
       break;
     }
-    // Intervallo lungo (~1 s): la Geonaute lo pretende, Android non glielo concede.
+    // La Geonaute sul vecchio ESP32 pretendeva un intervallo lungo (~1 s).
+    // Sul controller dell'S3 questo puo' non essere applicato: si prova a non toccarlo.
+#if HR_CONN_PARAMS
     hrClient->updateConnParams(800, 800, 0, 600);
+#endif
     ok = true;
   } while (0);
 
@@ -306,6 +328,7 @@ static void hrTask() {
       // (connect+subscribe sono sincroni: il display si ferma per la durata)
       hrConnectResult = hrConnect() ? 1 : 0;
       if (hrConnectResult > 0) {
+        hrReadyAt = millis();
         hrStateTo(HR_READY, "connesso");
       } else {
         hrNextTry = millis() + 5000;
@@ -322,6 +345,19 @@ static void hrTask() {
         tel.hr = 0;
         hrNextTry = millis() + 2000;
         hrStateTo(HR_IDLE, "disconnesso");
+      } else {
+        // connesso ma senza battito: se il segnale si perde (o non arriva mai)
+        // la connessione e' "zombie" -> si riparte da capo, come dopo un'accensione.
+        // Il primo battito puo' richiedere qualche secondo: 10 s di grazia; poi 3 s.
+        const uint32_t age   = tel.hrLastRx ? (millis() - tel.hrLastRx) : (millis() - hrReadyAt);
+        const uint32_t limit = tel.hrLastRx ? 3000 : 10000;
+        if (age > limit) {
+          NimBLEDevice::deleteClient(hrClient);
+          hrClient = nullptr;
+          tel.hr = 0;
+          hrNextTry = millis() + 1000;
+          hrStateTo(HR_IDLE, "nessun battito da 3 s");
+        }
       }
       break;
   }
@@ -403,6 +439,11 @@ static int  lastHeaderState = -1;  // BLE + GPS + stato colore cuore (-1 = da di
 static int  lastBattPct = -1;      // percentuale batteria disegnata (segmenti)
 static bool hrBlinkOn = false;     // lampeggio del cuore in acquisizione
 
+// simulazione delle grandezze per provare il display senza sensori (comando 'y')
+static bool  simEnabled = SIM_DEFAULT_ON;
+static float simSpd = 0.0f, simCad = 0.0f, simPw = 0.0f;
+static int   simDir = 1, simCadDir = 1, simPwDir = 1;   // +1 sale, -1 scende
+
 // velocita' a 7 segmenti vettoriale (scalabile al riquadro)
 static float heroSegUnits = 0;     // unita' di larghezza per cui e' tarata la geometria
 static int   heroSegLen = -1;      // numero di caratteri disegnati
@@ -451,6 +492,32 @@ static bool portrait = false;
 static uint8_t pageCount = PAGE_COUNT;
 
 static int heroX, heroY, heroW, heroH;   // pannello della velocita'
+static int bpmX, bpmY, bpmW, bpmH;      // cella del battito, accanto alla velocita'
+
+// sprite dedicato alla velocita': si disegna in RAM e si riversa in UNA passata
+// (i font VLW non hanno setTextPadding, quindi il metodo diretto farebbe flicker)
+static TFT_eSprite heroSprite = TFT_eSprite(&tft);
+static bool heroSpriteOk = false;
+
+// riga di celle sotto i pannelli: i bordi si allineano a quelli sopra
+//   [ TEMPO ][ CADENZA ] sotto la velocita'  |  [ POT W ] sotto il BPM
+static int pcX[3], pcW[3], pcY, pcH;
+static void rideCellsGeometry() {
+  const int gap = 4;
+  if (portrait) {
+    pcY = bpmY + bpmH + gap;
+    pcH = H - pcY - gap;
+    const int w3 = (W - 8 - gap * 2) / 3;
+    for (int i = 0; i < 3; i++) { pcX[i] = 4 + i * (w3 + gap); pcW[i] = w3; }
+  } else {
+    pcY = heroY + heroH + gap;
+    pcH = H - pcY - gap;
+    const int w2 = (heroW - gap) / 2;
+    pcX[0] = heroX;             pcW[0] = w2;                   // tempo
+    pcX[1] = heroX + w2 + gap;  pcW[1] = heroW - w2 - gap;    // cadenza (chiude a filo velocita')
+    pcX[2] = bpmX;              pcW[2] = bpmW;                 // potenza (a filo BPM)
+  }
+}
 
 // griglia corrente (impostata da setGrid)
 static int gCols, gRows, gX, gY, gW, gH;
@@ -461,6 +528,16 @@ static int gCols, gRows, gX, gY, gW, gH;
 
 static void setGrid(uint8_t mode, int nItems) {
   const int gap = 4;
+  // griglia della RIDE: UNA riga di celle sotto il pannello velocita'
+  if (mode == GRID_RIDE) {
+    gRows = 1;
+    gCols = nItems;
+    gX = 4;
+    gY = (portrait ? bpmY + bpmH : heroY + heroH) + gap;
+    gW = (W - gap * (gCols + 1)) / gCols;
+    gH = H - gY - gap;
+    return;
+  }
   if (portrait) {
     gCols = 2;
     gX = 4;
@@ -484,18 +561,29 @@ static void setupGeometry() {
   H = tft.height();
   portrait = (H > W);
   if (portrait) {
-    pageCount = PAGE_COUNT;                // RIDE + STATS + SYS (griglia 2x3)
-    heroX = 4;
-    heroY = HDR_H + 4;
-    heroW = W - 8;
-    heroH = 124;
-  } else {
     pageCount = PAGE_COUNT;
     heroX = 4;
-    heroY = HDR_H + 3;
-    heroW = 190;
-    heroH = 83;
+    heroY = 2;
+    heroW = W - 8;
+    heroH = 110;
+    bpmX = 4; bpmY = heroY + heroH + 4; bpmW = W - 8; bpmH = 56;
+  } else {
+    pageCount = PAGE_COUNT;
+    // orizzontale: tutto dal bordo superiore (l'header non e' piu' una banda a parte);
+    // velocita' a sinistra, BPM affiancato a destra, tre celle sotto
+    heroX = 4;
+    heroY = 2;
+    heroW = 198;
+    heroH = 100;
+    bpmX = heroX + heroW + 4;
+    bpmY = heroY;
+    bpmW = W - 4 - bpmX;
+    bpmH = heroH;
   }
+  rideCellsGeometry();
+  // sprite della velocita' (stessa larghezza del pannello, 56 px di altezza)
+  heroSprite.setColorDepth(16);
+  heroSpriteOk = (heroSprite.createSprite(heroW - 8, 84) != nullptr);
 }
 
 static bool gpsLive() { return bleConnected && tel.lastRx != 0 && (millis() - tel.lastRx <= 5000); }
@@ -553,15 +641,16 @@ static const uint8_t SEG_DIGITS[10] = {
   SEG_A|SEG_B|SEG_C|SEG_D|SEG_F|SEG_G,              // 9
 };
 
-// --- da qui in poi: rendering 7 segmenti (usato solo se HERO_RENDER_SEG == 1) ---
-#if HERO_RENDER_SEG
-
+// --- primitive dei 7 segmenti vettoriali (il secondo decimale le usa sempre;
+//     il rendering completo del riquadro si attiva con HERO_RENDER_SEG == 1) ---
 static uint8_t segMask(char c) {
   if (c >= '0' && c <= '9') return SEG_DIGITS[c - '0'];
   if (c == '-') return SEG_G;
   if (c == '.') return SEG_DOT;
   return 0;
 }
+
+#if HERO_RENDER_SEG
 
 // larghezza della stringa in "unita'": cifre 1.0, punto 0.30, spazio 0.06
 static float heroUnits(const char *s) {
@@ -590,6 +679,7 @@ static void heroClear() {
   memset(heroSegDrawn, 0, sizeof(heroSegDrawn));
   memset(heroSegInit, 0, sizeof(heroSegInit));
 }
+#endif  // HERO_RENDER_SEG (layout a celle del riquadro velocita')
 
 // --- segmenti come trapezi: riempimento di un colore + bordo di un altro
 static void segTrapH(int x, int y, int w, int t, uint16_t fill, uint16_t edge) {
@@ -624,10 +714,10 @@ static void segTrapVR(int x, int y, int h, int t, uint16_t fill, uint16_t edge) 
   tft.drawLine(x, y + h - p, x, y + p, edge);
 }
 
-// disegna UN segmento (bit) di una cifra: acceso colorato, spento come sagoma scura
-static void drawSeg7(int x, int y, int w, int h, int t, uint8_t bit, bool on, uint16_t colOn) {
+// disegna UN segmento (bit) di una cifra; col bordo 'edgeOn' quando e' acceso
+static void drawSeg7(int x, int y, int w, int h, int t, uint8_t bit, bool on, uint16_t colOn, uint16_t edgeOn) {
   const uint16_t fill = on ? colOn : C_PANEL;
-  const uint16_t edge = on ? C_SEG_EDGE : C_BORDER;
+  const uint16_t edge = on ? edgeOn : C_PANEL;
   const int hh = h / 2;
   const int hlen = hh - t;
   switch (bit) {
@@ -645,29 +735,49 @@ static void drawSeg7(int x, int y, int w, int h, int t, uint8_t bit, bool on, ui
   }
 }
 
+// cifra singola "piena" (senza bordo) per il secondo decimale della velocita'
+static void drawDigitSeg(int x, int y, int w, int h, int t, char c, uint16_t col) {
+  const uint8_t mask = segMask(c);
+  for (int b = 0; b < 7; b++) {
+    const uint8_t bit = (uint8_t)(1 << b);
+    drawSeg7(x, y, w, h, t, bit, (mask & bit) != 0, col, col);
+  }
+}
+
+#if HERO_RENDER_SEG
+
 static void drawHeroValue(const char *s, bool live) {
-  const int n = (int)strlen(s);
-  float uRef = 3.48f;                    // "88.8": dimensione di riferimento stabile
-  float u = heroUnits(s);
-  if (u > uRef) uRef = u;                // se serve piu' spazio, si adatta
+  int n = (int)strlen(s);
+  if (n > 8) n = 8;                      // gli array di cache sono da 8 posizioni
+
+  // Layout FISSO a celle (come un vero display): "88.8" = 3 celle-cifra + 1 punto.
+  // Le celle non usate restano visibili come sagoma spenta, cosi' le posizioni
+  // non cambiano quando il numero e' piu' corto (es. "5.2" invece di "38.2").
+  int cells = 4;
+  if (n > cells) cells = n;              // caso raro: "100.0"
+  const int pad = cells - n;             // celle vuote a sinistra (allineato a destra)
+
+  float uRef = (float)(cells - 1) + 0.30f + 0.06f * (cells - 1);   // 4 celle -> 3.48
   if (uRef != heroSegUnits) { heroSegLayout(uRef); heroSegUnits = uRef; heroSegLen = -1; }
-  if (n != heroSegLen || live != heroSegLive) { heroClear(); heroSegLen = n; heroSegLive = live; }
+  if (cells != heroSegLen || live != heroSegLive) { heroClear(); heroSegLen = cells; heroSegLive = live; }
 
   const uint16_t col = live ? C_FG : C_DIM;
   int total = 0;
-  for (int i = 0; i < n; i++) {
-    total += (s[i] == '.') ? (int)(segW * 0.30f) : segW;
+  for (int i = 0; i < cells; i++) {
+    const char c = (i < pad) ? ' ' : s[i - pad];
+    total += (c == '.') ? (int)(segW * 0.30f) : segW;
     if (i) total += segGap;
   }
   int x = heroX + (heroW - total) / 2;
-  for (int i = 0; i < n; i++) {
-    const int cw = (s[i] == '.') ? (int)(segW * 0.30f) : segW;
-    const uint8_t mask = segMask(s[i]);
+  for (int i = 0; i < cells; i++) {
+    const char c = (i < pad) ? ' ' : s[i - pad];
+    const int cw = (c == '.') ? (int)(segW * 0.30f) : segW;
+    const uint8_t mask = segMask(c);            // ' ' -> 0 (tutti spenti)
     if (!heroSegInit[i] || mask != heroSegDrawn[i]) {
       const uint8_t diff = heroSegInit[i] ? (uint8_t)(mask ^ heroSegDrawn[i]) : 0xFF;
       for (int b = 0; b < 8; b++) {
         const uint8_t bit = (uint8_t)(1 << b);
-        if (diff & bit) drawSeg7(x, segY, cw, segH, segT, bit, (mask & bit) != 0, col);
+        if (diff & bit) drawSeg7(x, segY, cw, segH, segT, bit, (mask & bit) != 0, col, C_SEG_EDGE);
       }
       heroSegDrawn[i] = mask;
       heroSegInit[i] = true;
@@ -712,7 +822,7 @@ static void drawHeaderStatic() {
 }
 
 // icona batteria a 4 segmenti: pieni in base alla percentuale, colore a scalare
-static void drawBatteryIcon(int x, int y, int pct) {
+static void drawBatteryIcon(int x, int y, int pct, uint16_t bg) {
   const int w = 26, h = 13;
   tft.drawRect(x, y, w, h, C_DIM);
   tft.fillRect(x + w, y + 4, 2, h - 8, C_DIM);       // tappo
@@ -721,7 +831,7 @@ static void drawBatteryIcon(int x, int y, int pct) {
   if (filled < 0) filled = 0;
   uint16_t col = (pct < 20) ? C_RED : (pct < 40 ? C_YELLOW : C_BATT);
   for (int i = 0; i < 4; i++)
-    tft.fillRect(x + 2 + i * 6, y + 2, 4, h - 4, (i < filled) ? col : C_BG);
+    tft.fillRect(x + 2 + i * 6, y + 2, 4, h - 4, (i < filled) ? col : bg);
 }
 
 // icone di stato 12x12: verdi quando il dato c'e', rosse quando manca
@@ -748,13 +858,32 @@ static void updateHeader() {
   const int state  = (bleOn ? 1 : 0) | (gpsOn ? 2 : 0) | (hrLive() ? 4 : 0) | (hrAcquiring() ? 8 : 0);
   if (state == lastHeaderState && pct == lastBattPct) return;
 
-  tft.fillRect(0, 0, 70, HDR_H, C_BG);          // pulizia area GPS/BLE/cuore
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(gpsOn ? C_BLUE : C_DIM, C_BG);
-  tft.drawString("GPS", 4, (HDR_H - 16) / 2, 2);
-  drawBleIcon(34, (HDR_H - 12) / 2, bleOn ? C_BLUE : C_DIM);
-  drawHeartIcon(54, (HDR_H - 12) / 2, hrLive() ? C_GREEN : (hrAcquiring() ? C_RED : C_DIM));
-  drawBatteryIcon(W - 36, (HDR_H - 13) / 2, pct);
+  const int iy = 7;
+  const uint16_t hbg = (page == P_RIDE) ? C_PANEL : C_BG;   // la RIDE non ha la banda header
+  if (page == P_RIDE) {
+    // RIDE: GPS + BLE + cuore + batteria giustificati a SINISTRA nel pannello velocita'
+    const int gap = 6;
+    const int gx = heroX + 6;                        // GPS (testo)
+    const int gpsW = tft.textWidth("GPS", 2);
+    const int bx = gx + gpsW + gap;                  // BLE
+    const int hx = bx + 12 + gap;                    // cuore
+    const int battX = hx + 12 + gap;                 // batteria
+    tft.fillRect(gx - 3, iy - 3, (battX + 28) - gx + 6, 18, hbg);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(gpsOn ? C_BLUE : C_DIM, hbg);
+    tft.drawString("GPS", gx, iy, 2);
+    drawBleIcon(bx, iy, bleOn ? C_BLUE : C_DIM);
+    drawHeartIcon(hx, iy, hrLive() ? C_GREEN : (hrAcquiring() ? C_RED : C_DIM));
+    drawBatteryIcon(battX, heroY + 6, pct, hbg);
+  } else {
+    tft.fillRect(4, iy, 62, 12, hbg);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(gpsOn ? C_BLUE : C_DIM, hbg);
+    tft.drawString("GPS", 4, iy, 2);
+    drawBleIcon(34, iy, bleOn ? C_BLUE : C_DIM);
+    drawHeartIcon(54, iy, hrLive() ? C_GREEN : (hrAcquiring() ? C_RED : C_DIM));
+    drawBatteryIcon(W - 36, (HDR_H - 13) / 2, pct, hbg);
+  }
 
   lastHeaderState = state;
   lastBattPct = pct;
@@ -778,49 +907,115 @@ static void fmtUptime(char *buf, size_t n) {
 
 // etichette delle pagine a griglia (usate anche dalla pagina RIDE in verticale)
 static const char *const STATS_LABELS[6] = {"DIST km", "TEMPO", "MEDIA km/h", "MAX km/h", "QUOTA m", "PENDENZA %"};
+static const char *const RIDE_LABELS[3]  = {"TEMPO", "CADENZA", "WATT"};
 static const char *const DIAG_LABELS[8]  = {"BLE", "CARDIO bpm", "SATELLITI", "BATTERIA", "QUOTA m", "PENDENZA %", "HEAP", "UPTIME"};
 
 // ---------------------------------------------------------------- pagina RIDE
+static void updateCell(int slot, int x, int y, int w, int h, const char *value, uint16_t col) {
+  if (strcmp(lastVals[slot], value) == 0 && lastValsCol[slot] == col) return;
+  drawFitted(x + 8, y + h - 16, w, value, col, C_PANEL);
+  strncpy(lastVals[slot], value, sizeof(lastVals[slot]) - 1);
+  lastVals[slot][sizeof(lastVals[slot]) - 1] = 0;
+  lastValsCol[slot] = col;
+}
+
+// cella del battito (slot cache 3): etichetta in alto centrata, numero grande centrato
+static void layoutBpmCell() {
+  tft.fillRoundRect(bpmX, bpmY, bpmW, bpmH, 6, C_PANEL);
+  tft.drawRoundRect(bpmX, bpmY, bpmW, bpmH, 6, C_BORDER);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(C_DIM, C_PANEL);
+  tft.loadFont(VLW_LABEL);
+  tft.drawString("BPM", bpmX + bpmW / 2, bpmY + 4);
+  tft.unloadFont();
+  tft.setTextDatum(TL_DATUM);
+}
+
+static void updateBpmValue(const char *v, uint16_t col) {
+  if (strcmp(lastVals[3], v) == 0 && lastValsCol[3] == col) return;
+  // cancella l'area del numero (i VLW non hanno setTextPadding)
+  tft.fillRect(bpmX + 4, bpmY + 28, bpmW - 8, bpmH - 32, C_PANEL);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(col, C_PANEL);
+  tft.loadFont(VLW_BIG);                                // 48 px antialiased
+  tft.drawString(v, bpmX + bpmW / 2, bpmY + bpmH / 2 + 6);
+  tft.unloadFont();
+  tft.setTextDatum(TL_DATUM);
+  strncpy(lastVals[3], v, sizeof(lastVals[3]) - 1);
+  lastVals[3][sizeof(lastVals[3]) - 1] = 0;
+  lastValsCol[3] = col;
+}
+
 static void layoutRide() {
-  // pannello velocita': tutto il box e' per il numero, nessuna etichetta
+  // pannello velocita' (tutto per il numero)
   tft.fillRoundRect(heroX, heroY, heroW, heroH, 6, C_PANEL);
   tft.drawRoundRect(heroX, heroY, heroW, heroH, 6, C_BORDER);
-
-  if (portrait) {
-    // verticale: sotto l'hero la griglia 2x2 con distanza, tempo, media, max
-    setGrid(GRID_RIDE, 4);
-    layoutGrid(STATS_LABELS, 4);
-    return;
+  // battito affiancato alla velocita'
+  layoutBpmCell();
+  // celle sotto, allineate ai confini dei pannelli sopra
+  for (int i = 0; i < 3; i++) {
+    tft.fillRoundRect(pcX[i], pcY, pcW[i], pcH, 6, C_PANEL);
+    tft.drawRoundRect(pcX[i], pcY, pcW[i], pcH, 6, C_BORDER);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(C_DIM, C_PANEL);
+    tft.loadFont(VLW_LABEL);                            // 16 px antialiased
+    tft.drawString(RIDE_LABELS[i], pcX[i] + pcW[i] / 2, pcY + 4);
+    tft.unloadFont();
+    tft.setTextDatum(TL_DATUM);
   }
+}
 
-  // orizzontale: distanza/tempo sotto l'hero, media/max a destra
-  const int gx = heroX + heroW + 4, gw = W - gx - 4;
-  const int cy = heroY + heroH + 4, ch = H - cy - 4;
-  const int cw = (heroW - 4) / 2;
-  drawCell(heroX, cy, cw, ch, "DIST km", "--", C_CYAN);
-  drawCell(heroX + cw + 4, cy, cw, ch, "TEMPO", "--", C_CYAN);
-  drawCell(gx, heroY, gw, (heroH - 4) / 2, "MEDIA km/h", "--", C_YELLOW);
-  drawCell(gx, heroY + (heroH - 4) / 2 + 4, gw, (heroH - 4) / 2, "MAX km/h", "--", C_YELLOW);
+// valore di una cella della riga RIDE: centrato, come i pannelli sopra
+static void updateProCell(int i, const char *val, uint16_t col) {
+  if (strcmp(lastVals[i], val) == 0 && lastValsCol[i] == col) return;
+  // i font VLW non hanno setTextPadding: si cancella l'area del valore a mano
+  tft.fillRect(pcX[i] + 4, pcY + 26, pcW[i] - 8, pcH - 30, C_PANEL);
+  tft.setTextDatum(BC_DATUM);
+  tft.setTextColor(col, C_PANEL);
+  tft.loadFont(VLW_VALUE);                              // 26 px antialiased
+  tft.drawString(val, pcX[i] + pcW[i] / 2, pcY + pcH - 6);
+  tft.unloadFont();
+  tft.setTextDatum(TL_DATUM);
+  strncpy(lastVals[i], val, sizeof(lastVals[i]) - 1);
+  lastVals[i][sizeof(lastVals[i]) - 1] = 0;
+  lastValsCol[i] = col;
 }
 
 static void updateRide() {
   char v[24];
-  bool live = gpsLive() || hrLive() || tel.lastRx != 0;
+  const float spd = simEnabled ? simSpd : tel.spd;
+  bool live = simEnabled || gpsLive() || hrLive() || tel.lastRx != 0;
 
-  // velocita' gigante (font 7 = "7 segment" 48 px)
-  if (live) snprintf(v, sizeof(v), "%.1f", tel.spd);
-  else      snprintf(v, sizeof(v), "-.-");
+  if (live) snprintf(v, sizeof(v), "%05.2f", spd);   // larghezza fissa: 00.00 invece di 0.00
+  else      snprintf(v, sizeof(v), "--.--");
   if (strcmp(v, lastHeroVal) != 0 || live != lastHeroLive) {
 #if HERO_RENDER_SEG
     drawHeroValue(v, live);
 #else
-    // font 7 segmenti bitmap di TFT_eSPI (FONT7), centrato nel riquadro
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(live ? C_FG : C_DIM, C_PANEL);
-    tft.setTextPadding(heroW - 12);   // cancella solo l'area del testo (anti-flicker)
-    tft.drawString(v, heroX + heroW / 2, heroY + heroH / 2, 7);
-    tft.setTextPadding(0);
-    tft.setTextDatum(TL_DATUM);
+    // numero (2 decimali) in font VLW 48 px, su sprite -> UNA passata, niente flicker
+    const int cy = heroY + heroH / 2 + 6;                 // stessa riga del BPM
+    const uint16_t hcol = live ? C_FG : C_DIM;
+    if (heroSpriteOk) {
+      heroSprite.fillSprite(C_PANEL);
+      heroSprite.setTextDatum(MC_DATUM);
+      heroSprite.setTextColor(hcol, C_PANEL);
+      // 52 px per "38.24"; se il numero ha 6 cifre (>= 100.00) si ripiega a 42 px
+      const uint8_t *hf = (strlen(v) > 5) ? VLW_BIG : VLW_SPEED;
+      heroSprite.loadFont(hf);
+      heroSprite.drawString(v, (heroW - 8) / 2, 39);   // 5 px piu' in su
+      heroSprite.unloadFont();
+      heroSprite.pushSprite(heroX + 4, cy - 39);
+      lastHeaderState = -1;      // lo sprite copre le icone: ridisegnale subito
+      updateHeader();
+    } else {
+      tft.fillRect(heroX + 4, cy - 39, heroW - 8, 78, C_PANEL);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(hcol, C_PANEL);
+      tft.loadFont((strlen(v) > 5) ? VLW_BIG : VLW_SPEED);
+      tft.drawString(v, heroX + heroW / 2, cy);
+      tft.unloadFont();
+      tft.setTextDatum(TL_DATUM);
+    }
     tft.setTextColor(C_DIM, C_PANEL);
 #endif
     strncpy(lastHeroVal, v, sizeof(lastHeroVal) - 1);
@@ -828,30 +1023,27 @@ static void updateRide() {
     lastHeroLive = live;
   }
 
-  const char *vals[6];
-  uint16_t cols[6];
-
-  if (portrait) {
-    setGrid(GRID_RIDE, 4);
-    statsValues(vals, cols);
-    updateGrid(vals, cols, 4);
-    return;
+  // battito, affiancato alla velocita' (colore = zona cardiaca)
+  {
+    char bs[24];
+    if (hrLive()) snprintf(bs, sizeof(bs), "%d", tel.hr); else strcpy(bs, "--");
+    updateBpmValue(bs, zoneColor(hrLive() ? hrZone(tel.hr) : -1));
   }
 
-  // orizzontale: 4 campi, con la stessa cache del resto della pagina
-  const int gx = heroX + heroW + 4, gw = W - gx - 4;
-  const int cy = heroY + heroH + 4, ch = H - cy - 4;
-  const int cw = (heroW - 4) / 2;
-  tft.setTextDatum(ML_DATUM);
-  if (live) snprintf(v, sizeof(v), "%.2f", tel.dst); else strcpy(v, "--");
-  drawFittedCached(0, heroX + 8, cy + ch - 16, cw, v, C_CYAN, C_PANEL);
-  if (live) fmtTime(tel.mov, v, sizeof(v)); else strcpy(v, "--");
-  drawFittedCached(1, heroX + cw + 12, cy + ch - 16, cw, v, C_CYAN, C_PANEL);
-  if (live) fmtAvg(v, sizeof(v)); else strcpy(v, "--");
-  drawFittedCached(2, gx + 8, heroY + (heroH - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
-  if (live) snprintf(v, sizeof(v), "%.1f", tel.mx); else strcpy(v, "--");
-  drawFittedCached(3, gx + 8, heroY + (heroH - 4) / 2 + 4 + (heroH - 4) / 2 - 16, gw, v, C_YELLOW, C_PANEL);
-  tft.setTextDatum(TL_DATUM);
+  // tre celle sotto: tempo, cadenza, potenza
+  uint16_t cols[3];
+  static char t[24], c[24], p[24];
+  if (simEnabled || gpsLive() || tel.lastRx != 0) fmtTime(tel.mov, t, sizeof(t)); else strcpy(t, "--");
+  if (simEnabled) snprintf(c, sizeof(c), "%d", (int)simCad);
+  else if (tel.cad > 0) snprintf(c, sizeof(c), "%d", tel.cad); else strcpy(c, "--");
+  if (simEnabled) snprintf(p, sizeof(p), "%d", (int)simPw);
+  else if (tel.pw  > 0) snprintf(p, sizeof(p), "%d", tel.pw);  else strcpy(p, "--");
+  cols[0] = (simEnabled || gpsLive() || tel.lastRx != 0) ? C_CYAN : C_DIM;
+  cols[1] = (simEnabled || tel.cad > 0) ? C_FG : C_DIM;
+  cols[2] = (simEnabled || tel.pw  > 0) ? C_FG : C_DIM;
+  updateProCell(0, t, cols[0]);
+  updateProCell(1, c, cols[1]);
+  updateProCell(2, p, cols[2]);
 }
 
 // ---------------------------------------------------------------- pagine a griglia
@@ -1344,8 +1536,8 @@ static void drawFull() {
     case P_RIDE:
       tft.fillScreen(C_BG);
       invalidateCache();
-      drawHeaderStatic();
       layoutRide();
+      updateHeader();      // le icone di stato stanno dentro i pannelli
       updateRide();
       break;
     case P_COST_SPEED:
@@ -1437,18 +1629,44 @@ struct Button { uint8_t pin; bool last; uint32_t tDown; bool longFired; };
 static Button btn1 = {BTN_SET,  HIGH, 0, false};
 static Button btn2 = {BTN_PAGE, HIGH, 0, false};
 
+// luminosita' del backlight in PWM (0..100%) + timer di inattivita'
+static int      blPct = 100;
+static uint32_t lastActivityMs = 0;     // ultima pressione di un tasto
+
+static void blApply(int pct) {
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  blPct = pct;
+  uint32_t duty = (uint32_t)((pct * 255) / 100);
+  if (TFT_BACKLIGHT_ON != HIGH) duty = 255 - duty;   // backlight attivo basso
+  ledcWrite(TFT_BL, duty);
+}
+
 static void setBacklight(bool on) {
   backlightOn = on;
-  digitalWrite(TFT_BL, on ? TFT_BACKLIGHT_ON : !TFT_BACKLIGHT_ON);
+  blApply(on ? 100 : 0);
 #if SERIAL_DEBUG
-  Serial.printf("backlight %s (pin %d = %d)\n", on ? "ON" : "OFF", TFT_BL, digitalRead(TFT_BL));
+  Serial.printf("backlight %s (pct %d)\n", on ? "ON" : "OFF", blPct);
 #endif
+}
+
+// Dopo 30 s senza tasti, la luminosita' scende al 50% in 5 secondi.
+static void taskDim() {
+  if (!backlightOn) return;
+  const uint32_t idle = millis() - lastActivityMs;
+  int target = 100;
+  if (idle >= 30000) {
+    const uint32_t ramp = idle - 30000;
+    target = (ramp >= 5000) ? 50 : 100 - (int)((ramp * 50) / 5000);
+  }
+  if (target != blPct) blApply(target);
 }
 
 static void printStatus() {
 #if SERIAL_DEBUG
-  Serial.printf("stato: backlightOn=%d pinBL(%d)=%d lcdPower(%d)=%d heap=%u page=%d/%d portrait=%d up=%lus\n",
-                backlightOn, TFT_BL, digitalRead(TFT_BL), PIN_LCD_POWER, digitalRead(PIN_LCD_POWER),
+  Serial.printf("stato: backlightOn=%d lum=%d%% idle=%lus pinBL(%d)=%d lcdPower(%d)=%d heap=%u page=%d/%d portrait=%d up=%lus\n",
+                backlightOn, blPct, (unsigned long)((millis() - lastActivityMs) / 1000),
+                TFT_BL, digitalRead(TFT_BL), PIN_LCD_POWER, digitalRead(PIN_LCD_POWER),
                 (unsigned)ESP.getFreeHeap(), page + 1, pageCount, (int)portrait, (unsigned long)(millis() / 1000));
   Serial.printf("tasti: SET(btn1,%d)=%d PAGE(btn2,%d)=%d | soglie: %d %d %d %d | tgtSpeed=%.1f tgtHr=%d | campo=%d\n",
                 PIN_BTN1, digitalRead(PIN_BTN1), PIN_BTN2, digitalRead(PIN_BTN2),
@@ -1586,6 +1804,7 @@ static void handleButtons() {
 
   bool s1 = digitalRead(btn1.pin);
   bool s2 = digitalRead(btn2.pin);
+  if (s1 == LOW || s2 == LOW) lastActivityMs = millis();   // attivita' utente
 
   // --- entrambi i tasti premuti per >1 s: apre/chiude la pagina SOGLIE CARDIO
   static uint32_t bothSince = 0;
@@ -1674,10 +1893,14 @@ void setup() {
   // batteria: partitore 1:2, attenuazione massima per arrivare a ~4,2 V
   analogSetPinAttenuation(PIN_BAT, ADC_11db);
 
+  Serial.printf("ledcAttach(BL=%d) -> %d  (duty 50%% = %d)\n",
+                TFT_BL, (int)ledcAttach(TFT_BL, 5000, 8), (50 * 255) / 100);
   tft.init();
   tft.setRotation(ROTATION);
   setupGeometry();
+  lastActivityMs = millis();
   setBacklight(true);
+  simEnabled = SIM_DEFAULT_ON;   // simulazione attiva all'avvio (vedi SIM_DEFAULT_ON)
 
   C_BG     = rgb(0x16, 0x17, 0x20);
   C_PANEL  = rgb(0x1f, 0x23, 0x35);
@@ -1760,6 +1983,21 @@ static void taskTargetTime() {              // 1 Hz: secondi passati nel target
   } else if (page == P_COST_SPEED) {
     if ((gpsLive() || tel.lastRx != 0) && fabs(tel.spd - targetSpeed) <= TOLL_SPEED) timeInTarget++;
   }
+}
+
+static void taskSim() {                     // 4 Hz: grandezze simulate (velocita', cadenza, watt)
+  if (!simEnabled) return;
+  simSpd += simDir * 0.07f;                 // ~2,8 km/h al secondo, 2 decimali che variano
+  if (simSpd >= 45.0f) { simSpd = 45.0f; simDir = -1; }
+  if (simSpd <= 0.0f)  { simSpd = 0.0f;  simDir = 1; }
+
+  simCad += simCadDir * 0.9f;               // 55..100 rpm
+  if (simCad >= 100.0f) { simCad = 100.0f; simCadDir = -1; }
+  if (simCad <= 55.0f)  { simCad = 55.0f;  simCadDir = 1; }
+
+  simPw += simPwDir * 4.0f;                 // 0..380 W
+  if (simPw >= 380.0f) { simPw = 380.0f; simPwDir = -1; }
+  if (simPw <= 0.0f)   { simPw = 0.0f;   simPwDir = 1; }
 }
 
 static void taskDisplay() {                 // 4 Hz: ridisegna solo i valori cambiati (cache)
@@ -1933,6 +2171,56 @@ static void taskSerial() {
                     (unsigned long)schedRuns, (unsigned long)schedMaxJitter, (int)hrConnectResult);
       schedMaxJitter = 0;
     }
+    else if (c == 'y') {
+      // test: attiva/disattiva la simulazione della velocita'
+      simEnabled = !simEnabled;
+      if (simEnabled) { simSpd = 0.0f; simCad = 55.0f; simPw = 0.0f; simDir = 1; simCadDir = 1; simPwDir = 1; }
+      lastHeroVal[0] = 0;
+      heroSegLen = -1;
+      Serial.printf("simulazione velocita': %s\n", simEnabled ? "ON" : "OFF");
+    }
+    else if (c == 'l') {
+      // test luminosita': cicla 100 -> 50 -> 20 -> 5 -> 10 -> 100
+      static const int lv[] = {100, 50, 20, 5, 10};
+      static uint8_t li = 0;
+      blApply(lv[li]); li = (uint8_t)((li + 1) % 5);
+      lastActivityMs = millis();          // non far scattare il dim
+      Serial.printf("luminosita' -> %d%%\n", blPct);
+    }
+    else if (c == 'R') {
+      // riavvio remoto della scheda
+      Serial.println("riavvio...");
+      Serial.flush();     // nessun delay: il flush basta
+      esp_restart();
+    }
+    else if (c == 'w') {
+      // test dei font VLW: se textWidth e' 0 il glifo non viene trovato
+      tft.loadFont(VLW_BIG);
+      Serial.printf("VLW_BIG:   '0'=%d '38.24'=%d '--'=%d\n",
+                    tft.textWidth("0"), tft.textWidth("38.24"), tft.textWidth("--"));
+      tft.unloadFont();
+      tft.loadFont(VLW_VALUE);
+      Serial.printf("VLW_VALUE: '0'=%d '1:23'=%d\n", tft.textWidth("0"), tft.textWidth("1:23"));
+      tft.unloadFont();
+      tft.loadFont(VLW_LABEL);
+      Serial.printf("VLW_LABEL: 'T'=%d 'TEMPO'=%d\n", tft.textWidth("T"), tft.textWidth("TEMPO"));
+      tft.unloadFont();
+      // prova visiva diretta: sfondo nero, cifre in bianco, righe separate
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextColor(TFT_WHITE);
+      tft.loadFont(VLW_BIG);
+      tft.drawString("0123456789", 4, 4);          // una sola riga, per vedere se le cifre si accavallano
+      tft.unloadFont();
+      tft.loadFont(VLW_VALUE);
+      tft.drawString("0123456789", 4, 80);
+      tft.unloadFont();
+      tft.loadFont(VLW_LABEL);
+      tft.drawString("ABCDEFGHIJKLM", 4, 130);
+      tft.unloadFont();
+      tft.drawFastHLine(0, 118, 320, TFT_RED);      // riga di riferimento
+      Serial.println("test: 3 righe separate (grande/medio/piccolo) + riga rossa a y=118");
+    }
     else if (c == 'f') {
       // larghezze reali dei font: serve a sapere quali stringhe entrano nel riquadro
       Serial.printf("hero: heroW=%d utile=%d\n", heroW, heroW - 16);
@@ -1979,9 +2267,11 @@ static TaskDef sched[] = {
   {"buttons",    10, 0, handleButtons},
   {"hr",         50, 0, hrTask},
   {"serial",     20, 0, taskSerial},
-  {"display",   250, 0, taskDisplay},
-  {"blink",     500, 0, taskBlink},
-  {"header",   1000, 0, taskHeader},
+  {"display",   500, 0, taskDisplay},
+  {"sim",       250, 0, taskSim},
+  {"blink",    1000, 0, taskBlink},
+  {"dim",       100, 0, taskDim},
+  {"header",   2500, 0, taskHeader},
   {"nvs",      1000, 0, taskSaveSettings},
   {"battery",  1000, 0, taskBattery},
   {"target",   1000, 0, taskTargetTime},
