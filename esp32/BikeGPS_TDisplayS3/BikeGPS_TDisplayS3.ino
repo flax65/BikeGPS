@@ -1171,7 +1171,8 @@ static void printStatus() {
   Serial.printf("stato: backlightOn=%d pinBL(%d)=%d lcdPower(%d)=%d heap=%u page=%d/%d portrait=%d up=%lus\n",
                 backlightOn, TFT_BL, digitalRead(TFT_BL), PIN_LCD_POWER, digitalRead(PIN_LCD_POWER),
                 (unsigned)ESP.getFreeHeap(), page + 1, pageCount, (int)portrait, (unsigned long)(millis() / 1000));
-  Serial.printf("soglie: %d %d %d %d | tgtSpeed=%.1f tgtHr=%d | campo=%d\n",
+  Serial.printf("tasti: SET(btn1,%d)=%d PAGE(btn2,%d)=%d | soglie: %d %d %d %d | tgtSpeed=%.1f tgtHr=%d | campo=%d\n",
+                PIN_BTN1, digitalRead(PIN_BTN1), PIN_BTN2, digitalRead(PIN_BTN2),
                 zoneLim[0], zoneLim[1], zoneLim[2], zoneLim[3], targetSpeed, targetHr, setupField);
 #endif
 }
@@ -1371,10 +1372,13 @@ static void handleButtons() {
 }
 
 // ---------------------------------------------------------------- setup
+// in avvio i task partono tutti "adesso": cosi' il jitter non conta il tempo dall'accensione
+static void schedInit();
+
 void setup() {
 #if SERIAL_DEBUG
   Serial.begin(115200);
-  delay(300);
+  { uint32_t t = millis(); while (millis() - t < 300) vTaskDelay(1); }   // USB CDC pronta (no delay)
   Serial.println("\nBikeGPS T-Display-S3");
 #endif
 
@@ -1420,9 +1424,9 @@ void setup() {
   printStatus();
 #endif
 
-  // misura iniziale batteria (media di qualche lettura)
+  // misura iniziale batteria (media di qualche lettura, oversampling ADC)
   float acc = 0;
-  for (int i = 0; i < 8; i++) { acc += battVolts(); delay(5); }
+  for (int i = 0; i < 8; i++) acc += battVolts();
   battFiltered = acc / 8.0f;
 
   tft.fillScreen(C_BG);
@@ -1455,43 +1459,36 @@ void setup() {
   Serial.println("BikeGPS pronto, in attesa del telefono");
 #endif
 
-  delay(600);
+  // il primo disegno avviene subito; da qui in poi lo aggiorna il task display
   drawFull();
+  schedInit();
 }
 
-// ---------------------------------------------------------------- loop
-void loop() {
-  handleButtons();
-  hrTask();
+// ---------------------------------------------------------------- task a tempo
+// Nessun delay() di attesa: ogni task ha il suo periodo e viene eseguito quando scade.
+static uint32_t schedRuns = 0, schedMaxJitter = 0;   // statistiche dello scheduler
 
-  // batteria: media esponenziale, una lettura ogni secondo
-  static uint32_t lastBatt = 0;
-  if (millis() - lastBatt >= 1000) {
-    lastBatt = millis();
-    float v = battVolts();
-    battFiltered = (battFiltered <= 0) ? v : (battFiltered * 0.9f + v * 0.1f);
+static void taskBattery() {                 // 1 Hz: media esponenziale della batteria
+  float v = battVolts();
+  battFiltered = (battFiltered <= 0) ? v : (battFiltered * 0.9f + v * 0.1f);
+}
+
+static void taskTargetTime() {              // 1 Hz: secondi passati nel target
+  if (page == P_COST_BPM) {
+    if (hrLive() && abs(tel.hr - targetHr) <= TOLL_HR) timeInTarget++;
+  } else if (page == P_COST_SPEED) {
+    if ((gpsLive() || tel.lastRx != 0) && fabs(tel.spd - targetSpeed) <= TOLL_SPEED) timeInTarget++;
   }
+}
 
-  static uint32_t lastDraw = 0;
-  if (!freezeDraw && millis() - lastDraw >= 250) {
-    lastDraw = millis();
-    drawValues();
-  }
+static void taskDisplay() {                 // 4 Hz: ridisegna solo i valori cambiati (cache)
+  if (!freezeDraw) drawValues();
+}
 
-  // tempo passato in target (una volta al secondo)
-  static uint32_t lastTgtTick = 0;
-  if (millis() - lastTgtTick >= 1000) {
-    lastTgtTick = millis();
-    if (page == P_COST_BPM) {
-      if (hrLive() && abs(tel.hr - targetHr) <= TOLL_HR) timeInTarget++;
-    } else if (page == P_COST_SPEED) {
-      if ((gpsLive() || tel.lastRx != 0) && fabs(tel.spd - targetSpeed) <= TOLL_SPEED) timeInTarget++;
-    }
-  }
-
-  // comandi di test da seriale: n = pagina avanti, p = indietro, b = retroilluminazione
-  //   d = riaccendi + ridisegna, s = stato pin/heap
-  //   r = schermo rosso pieno (test pannello diretto), v = verde, k = nero
+// comandi di test da seriale: n = pagina avanti, p = indietro, b = retroilluminazione
+//   d = riaccendi + ridisegna, s = stato pin/heap
+//   r = schermo rosso pieno (test pannello diretto), v = verde, k = nero
+static void taskSerial() {
   if (Serial.available()) {
     int c = Serial.read();
     if (c == 'n') {
@@ -1636,6 +1633,12 @@ void loop() {
       drawFull();
       Serial.println("PROFILO fine");
     }
+    else if (c == 'j') {
+      // stato dello scheduler: quante esecuzioni e quanto sono in ritardo
+      Serial.printf("scheduler: esecuzioni=%lu jitterMax=%lu ms\n",
+                    (unsigned long)schedRuns, (unsigned long)schedMaxJitter);
+      schedMaxJitter = 0;
+    }
     else if (c == 'd') {
       printStatus();
       digitalWrite(PIN_LCD_POWER, HIGH);
@@ -1647,5 +1650,38 @@ void loop() {
       printStatus();
     }
   }
-  delay(5);
+}
+
+// ---------------------------------------------------------------- scheduler
+// Tabella di task periodici: il loop esegue i task scaduti e poi cede la CPU.
+// vTaskDelay(1) e' uno yield al sistema operativo (1 ms), non un'attesa a tempo.
+struct TaskDef { const char *name; uint32_t periodMs; uint32_t last; void (*fn)(); };
+static TaskDef sched[] = {
+  {"buttons",    10, 0, handleButtons},
+  {"hr",         50, 0, hrTask},
+  {"serial",     20, 0, taskSerial},
+  {"display",   250, 0, taskDisplay},
+  {"battery",  1000, 0, taskBattery},
+  {"target",   1000, 0, taskTargetTime},
+};
+static const size_t N_TASKS = sizeof(sched) / sizeof(sched[0]);
+
+static void schedInit() {
+  const uint32_t t = millis();
+  for (size_t i = 0; i < N_TASKS; i++) sched[i].last = t;
+}
+
+void loop() {
+  const uint32_t now = millis();
+  for (size_t i = 0; i < N_TASKS; i++) {
+    uint32_t elapsed = now - sched[i].last;
+    if (elapsed >= sched[i].periodMs) {
+      uint32_t jit = elapsed - sched[i].periodMs;   // ritardo rispetto alla scadenza
+      if (jit > schedMaxJitter) schedMaxJitter = jit;
+      schedRuns++;
+      sched[i].last = now;
+      sched[i].fn();
+    }
+  }
+  vTaskDelay(1);   // yield: lascia girare i task di sistema, niente busy-wait
 }
