@@ -84,15 +84,14 @@ differenza è `User_Setup.h` (personalizzato GC9A01, da tenere).
 
 ### Layout scelto
 
-**Verticale (170x320, rotazione 0 — impostazione attuale)**:
+**Verticale (170x320, rotazione 0 — impostazione attuale)** — 3 pagine:
 - **Pagina RIDE**: velocità gigante (font 7-segment 48 px) che occupa tutta la
   larghezza in alto + griglia 2x2 sotto (DIST, TEMPO, MEDIA, MAX).
-- **Pagina SYS**: griglia 2x3 a tutta altezza (BLE, CARDIO, SATELLITI, BATTERIA,
-  HEAP, UPTIME).
-- In verticale le statistiche complete stanno nella pagina RIDE, quindi le pagine
-  sono **2** (in orizzontale 3).
+- **Pagina STATS**: griglia 2x3 a tutta altezza (DIST, TEMPO, MEDIA, MAX, QUOTA,
+  PENDENZA).
+- **Pagina SYS**: griglia 2x3 (BLE, CARDIO, SATELLITI, BATTERIA, HEAP, UPTIME).
 
-**Orizzontale (320x170, rotazione 1)**:
+**Orizzontale (320x170, rotazione 1)** — 3 pagine:
 - **RIDE**: velocità gigante a sinistra + DIST/TEMPO in basso e MEDIA/MAX a destra.
 - **STATS**: griglia 3x2 (DIST, TEMPO, MEDIA, MAX, QUOTA, PENDENZA).
 - **SYS**: griglia 3x2 (BLE, CARDIO, SATELLITI, BATTERIA, HEAP, UPTIME).

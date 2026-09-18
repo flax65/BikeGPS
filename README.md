@@ -110,13 +110,15 @@ Se il BLE è scollegato il valore diventa `---` e compare `no BLE`
 
 Sketch separato: `esp32/BikeGPS_TDisplayS3/` (il codice BLE/parsing è identico).
 Schermo **verticale 170x320** (rotazione 0; basta cambiare `ROTATION` per
-l'orizzontale) — in verticale 2 pagine, in orizzontale 3:
+l'orizzontale) — **3 pagine** in entrambi gli orientamenti:
 
 | Pagina | Contenuto |
 |---|---|
-| **RIDE** | velocità gigante (font 7-segment 48 px) + distanza, tempo, media, max (in verticale anche quota e pendenza nella griglia sotto) |
-| **STATS** | solo orizzontale: griglia 3x2 con distanza, tempo, media, max, quota, pendenza |
+| **RIDE** | velocità gigante (font 7-segment 48 px) + distanza, tempo, media, max |
+| **STATS** | griglia: distanza, tempo, media, max, quota, pendenza |
 | **SYS** | BLE, cardio, satelliti, batteria (%, V), heap libero, uptime |
+
+La griglia è 2×3 in verticale e 3×2 in orizzontale (calcolata a runtime).
 
 Pulsanti integrati:
 - **GPIO0** (BOOT) corto → pagina avanti, tenuto premuto (>0,8 s) → retroilluminazione on/off

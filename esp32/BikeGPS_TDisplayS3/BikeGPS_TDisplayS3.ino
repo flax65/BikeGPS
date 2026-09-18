@@ -292,7 +292,7 @@ static void invalidateCache() {
 // Calcolata in setup() in base all'orientamento (ROTATION).
 static int W, H;
 static bool portrait = false;
-static uint8_t pageCount = PAGE_COUNT;   // in verticale le statistiche sono nella pagina RIDE
+static uint8_t pageCount = PAGE_COUNT;
 
 static int heroX, heroY, heroW, heroH;   // pannello della velocita'
 
@@ -333,7 +333,7 @@ static void setupGeometry() {
   H = tft.height();
   portrait = (H > W);
   if (portrait) {
-    pageCount = 2;                        // RIDE (con statistiche) + SYS
+    pageCount = PAGE_COUNT;                // RIDE + STATS + SYS (griglia 2x3)
     heroX = 4;
     heroY = HDR_H + 4;
     heroW = W - 8;
@@ -570,7 +570,6 @@ static void drawFull() {
       updateRide();
       break;
     case P_STATS:
-      if (portrait) break;   // in verticale le statistiche sono nella pagina RIDE
       setGrid(GRID_FULL, 6);
       layoutGrid(STATS_LABELS, 6);
       statsValues(vals, cols);
@@ -594,7 +593,6 @@ static void drawValues() {
       updateRide();
       break;
     case P_STATS:
-      if (portrait) break;
       setGrid(GRID_FULL, 6);
       statsValues(vals, cols);
       updateGrid(STATS_LABELS, vals, cols, 6);
@@ -770,9 +768,21 @@ void loop() {
   //   r = schermo rosso pieno (test pannello diretto), v = verde, k = nero
   if (Serial.available()) {
     int c = Serial.read();
-    if (c == 'n') { freezeDraw = false; page = (page + 1) % pageCount; drawFull(); }
-    else if (c == 'p') { freezeDraw = false; page = (page + pageCount - 1) % pageCount; drawFull(); }
-    else if (c == 'b') setBacklight(!backlightOn);
+    if (c == 'n') {
+      freezeDraw = false;
+      page = (page + 1) % pageCount;
+#if SERIAL_DEBUG
+      Serial.printf("pagina -> %d/%d\n", page + 1, pageCount);
+#endif
+      drawFull();
+    } else if (c == 'p') {
+      freezeDraw = false;
+      page = (page + pageCount - 1) % pageCount;
+#if SERIAL_DEBUG
+      Serial.printf("pagina -> %d/%d\n", page + 1, pageCount);
+#endif
+      drawFull();
+    } else if (c == 'b') setBacklight(!backlightOn);
     else if (c == 's') printStatus();
     else if (c == 'r' || c == 'v' || c == 'k') {
       // test diretto sul pannello, senza passare dallo sprite
