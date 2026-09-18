@@ -350,8 +350,9 @@ static char lastVals[8][24];
 static uint16_t lastValsCol[8];
 static char lastHeroVal[24];
 static bool lastHeroLive = false;
-static char lastHeader[32];
-static uint16_t lastHeaderCol = 0;
+static int  lastHeaderState = -1;  // BLE + GPS + stato colore cuore (-1 = da disegnare)
+static int  lastBattPct = -1;      // percentuale batteria disegnata (segmenti)
+static bool hrBlinkOn = false;     // lampeggio del cuore in acquisizione
 // cache delle pagine di allenamento
 static char lastTgt[24], lastHeroC[24], lastDev[24], lastInfo[40], lastTime[24];
 static uint16_t lastHeroCCol = 0;   // colore dell'hero (cambia senza che cambi il testo)
@@ -365,8 +366,8 @@ static void invalidateCache() {
   memset(lastValsCol, 0, sizeof(lastValsCol));
   lastHeroVal[0] = 0;
   lastHeroLive = false;
-  lastHeader[0] = 0;
-  lastHeaderCol = 0;
+  lastHeaderState = -1;
+  lastBattPct = -1;
   lastTgt[0] = lastHeroC[0] = lastDev[0] = lastInfo[0] = lastTime[0] = 0;
   lastHeroCCol = 0;
   lastZoneShown = -9;
@@ -439,6 +440,8 @@ static void setupGeometry() {
 
 static bool gpsLive() { return bleConnected && tel.lastRx != 0 && (millis() - tel.lastRx <= 5000); }
 static bool hrLive()  { return tel.hrLastRx != 0 && (millis() - tel.hrLastRx <= 5000); }
+// "in acquisizione": sta cercando o si sta connettendo alla cintura
+static bool hrAcquiring() { return hrState == HR_SCANNING || hrState == HR_CONNECTING; }
 
 // Helper: testo con scelta automatica del font in base alla larghezza utile
 static void drawFitted(int x, int y, int w, const char *s, uint16_t fg, uint16_t bg) {
@@ -486,38 +489,72 @@ static const char *pageTitle() {
   return "BikeGPS";
 }
 
+static void updateHeader();   // definita sotto: la richiama drawHeaderStatic
+
+// intestazione: niente titolo pagina, solo stato BLE (colore) e batteria (pittogramma)
 static void drawHeaderStatic() {
   tft.fillRect(0, 0, W, HDR_H, C_BG);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(C_BLUE, C_BG);
-  tft.setTextPadding(W / 2);
-  tft.drawString(pageTitle(), 6, 5, 2);
-  tft.setTextPadding(0);
+  lastHeaderState = -1;
+  lastBattPct = -1;                 // forza il ridisegno di stato e batteria
+  updateHeader();
 }
 
-// parte variabile dell'intestazione: stato BLE + batteria (solo se cambia)
+// icona batteria a 4 segmenti: pieni in base alla percentuale, colore a scalare
+static void drawBatteryIcon(int x, int y, int pct) {
+  const int w = 26, h = 13;
+  tft.drawRect(x, y, w, h, C_DIM);
+  tft.fillRect(x + w, y + 4, 2, h - 8, C_DIM);       // tappo
+  int filled = (pct + 12) / 25;                       // 0..4 segmenti
+  if (filled > 4) filled = 4;
+  if (filled < 0) filled = 0;
+  uint16_t col = (pct < 20) ? C_RED : (pct < 40 ? C_YELLOW : C_GREEN);
+  for (int i = 0; i < 4; i++)
+    tft.fillRect(x + 2 + i * 6, y + 2, 4, h - 4, (i < filled) ? col : C_BG);
+}
+
+// icone di stato 12x12: verdi quando il dato c'e', rosse quando manca
+static void drawBleIcon(int x, int y, uint16_t col) {         // runa Bluetooth
+  const int cx = x + 4;
+  tft.drawLine(cx, y, cx, y + 11, col);
+  tft.drawLine(cx, y, cx + 4, y + 3, col);
+  tft.drawLine(cx + 4, y + 3, cx - 4, y + 9, col);
+  tft.drawLine(cx, y + 11, cx + 4, y + 8, col);
+  tft.drawLine(cx + 4, y + 8, cx - 4, y + 2, col);
+}
+
+static void drawHeartIcon(int x, int y, uint16_t col) {       // cuore
+  tft.fillCircle(x + 3, y + 4, 3, col);
+  tft.fillCircle(x + 8, y + 4, 3, col);
+  tft.fillTriangle(x, y + 5, x + 11, y + 5, x + 6, y + 12, col);
+}
+
+// parte variabile dell'intestazione: GPS, BLE, cuore, batteria (solo se cambiano)
 static void updateHeader() {
-  char st[32];
-  snprintf(st, sizeof(st), "%s  %d%%", bleConnected ? "BLE" : "no BLE", battPercent());
-  uint16_t col = bleConnected ? C_GREEN : C_RED;
-  if (strcmp(st, lastHeader) == 0 && col == lastHeaderCol) return;
+  const int pct    = battPercent();
+  const bool gpsOn = gpsLive();
+  const bool bleOn = bleConnected;
+  // cuore: 0 grigio (offline), 1 verde (legge), 2/3 rosso lampeggiante (acquisizione)
+  const int hrIdx  = hrLive() ? 1 : (hrAcquiring() ? (2 + (hrBlinkOn ? 1 : 0)) : 0);
+  const int state  = (bleOn ? 1 : 0) | (gpsOn ? 2 : 0) | (hrIdx << 2);
+  if (state == lastHeaderState && pct == lastBattPct) return;
 
-  tft.setTextDatum(TR_DATUM);
-  tft.setTextColor(col, C_BG);
-  tft.setTextPadding(100);          // cancella solo l'area del testo (anti-flicker)
-  tft.drawString(st, W - 6, 5, 2);
-  tft.setTextPadding(0);
+  tft.fillRect(0, 0, 70, HDR_H, C_BG);          // pulizia area GPS/BLE/cuore
   tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(gpsOn ? C_BLUE : C_DIM, C_BG);
+  tft.drawString("GPS", 4, (HDR_H - 16) / 2, 2);
+  drawBleIcon(34, (HDR_H - 12) / 2, bleOn ? C_BLUE : C_DIM);
+  drawHeartIcon(54, (HDR_H - 12) / 2, hrLive() ? C_GREEN : (hrAcquiring() ? (hrBlinkOn ? C_RED : C_DIM) : C_DIM));
+  drawBatteryIcon(W - 36, (HDR_H - 13) / 2, pct);
 
-  strncpy(lastHeader, st, sizeof(lastHeader) - 1);
-  lastHeader[sizeof(lastHeader) - 1] = 0;
-  lastHeaderCol = col;
+  lastHeaderState = state;
+  lastBattPct = pct;
 }
 
 // --- formattazioni condivise
+// tempo in movimento: solo ore e minuti (i secondi rendevano il testo piccolo)
 static void fmtTime(uint32_t t, char *buf, size_t n) {
-  snprintf(buf, n, "%lu:%02lu:%02lu",
-           (unsigned long)(t / 3600), (unsigned long)((t % 3600) / 60), (unsigned long)(t % 60));
+  snprintf(buf, n, "%lu:%02lu",
+           (unsigned long)(t / 3600), (unsigned long)((t % 3600) / 60));
 }
 static void fmtAvg(char *buf, size_t n) {
   float avg = (tel.mov > 0) ? tel.dst / (tel.mov / 3600.0f) : 0.0f;
@@ -535,14 +572,9 @@ static const char *const DIAG_LABELS[8]  = {"BLE", "CARDIO bpm", "SATELLITI", "B
 
 // ---------------------------------------------------------------- pagina RIDE
 static void layoutRide() {
-  // pannello velocita' + etichetta unita'
+  // pannello velocita': tutto il box e' per il numero, nessuna etichetta
   tft.fillRoundRect(heroX, heroY, heroW, heroH, 6, C_PANEL);
   tft.drawRoundRect(heroX, heroY, heroW, heroH, 6, C_BORDER);
-  tft.setTextDatum(BR_DATUM);
-  tft.setTextColor(C_DIM, C_PANEL);
-  tft.drawString("km/h", heroX + heroW - 8, heroY + heroH - 6, 2);
-  tft.setTextDatum(TL_DATUM);
-  tft.drawFastHLine(heroX + 8, heroY + heroH - 24, heroW - 16, C_BORDER);
 
   if (portrait) {
     // verticale: sotto l'hero la griglia 2x2 con distanza, tempo, media, max
@@ -569,16 +601,14 @@ static void updateRide() {
   if (live) snprintf(v, sizeof(v), "%.1f", tel.spd);
   else      snprintf(v, sizeof(v), "-.-");
   if (strcmp(v, lastHeroVal) != 0 || live != lastHeroLive) {
+    // velocita' gigante centrata in tutto il box
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(live ? C_FG : C_DIM, C_PANEL);
     tft.setTextPadding(heroW - 12);   // cancella solo l'area del testo (anti-flicker)
-    tft.drawString(v, heroX + heroW / 2, heroY + heroH / 2 - 8, 7);
+    tft.drawString(v, heroX + heroW / 2, heroY + heroH / 2, 7);
     tft.setTextPadding(0);
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(C_DIM, C_PANEL);
-    tft.setTextPadding(heroW - 16);
-    tft.drawString(live ? "" : "no GPS", heroX + 8, heroY + heroH - 20, 2);
-    tft.setTextPadding(0);
     strncpy(lastHeroVal, v, sizeof(lastHeroVal) - 1);
     lastHeroVal[sizeof(lastHeroVal) - 1] = 0;
     lastHeroLive = live;
@@ -851,9 +881,8 @@ static void drawTimeRow(const char *s) {
 
 // --- valori comuni alle pagine di allenamento
 static void costTimeStr(char *buf, size_t n) {
-  snprintf(buf, n, "in target %lu:%02lu:%02lu",
-           (unsigned long)(timeInTarget / 3600), (unsigned long)((timeInTarget % 3600) / 60),
-           (unsigned long)(timeInTarget % 60));
+  snprintf(buf, n, "in target %lu:%02lu",
+           (unsigned long)(timeInTarget / 3600), (unsigned long)((timeInTarget % 3600) / 60));
 }
 
 // --- COST SPEED (velocita' costante)
@@ -867,7 +896,7 @@ static void layoutCostSpeed() {
   layoutCostHero("km/h");
   layoutDevBar(R_DEVBR.x, R_DEVBR.y, R_DEVBR.w, R_DEVBR.h, DEV_RANGE_SPEED, TOLL_SPEED);
   layoutInfoRow();
-  drawTimeRow("in target --:--:--");
+  drawTimeRow("in target --:--");
   updateTargetValue("--", C_GREEN);
   updateCostHeroValue("--", C_FG);
   updateInfoValue("--");
@@ -943,7 +972,7 @@ static void layoutCostBpm() {
   layoutCostHero("bpm");
   layoutDevBar(R_DEVBR.x, R_DEVBR.y, R_DEVBR.w, R_DEVBR.h, DEV_RANGE_HR, TOLL_HR);
   layoutInfoRow();
-  drawTimeRow("in target --:--:--");
+  drawTimeRow("in target --:--");
   updateTargetValue("--", C_RED);
   updateCostHeroValue("--", C_FG);
   updateInfoValue("--");
@@ -1522,6 +1551,7 @@ static void taskTargetTime() {              // 1 Hz: secondi passati nel target
 }
 
 static void taskDisplay() {                 // 4 Hz: ridisegna solo i valori cambiati (cache)
+  hrBlinkOn = !hrBlinkOn;                   // lampeggio del cuore in acquisizione (2 Hz)
   if (!freezeDraw) drawValues();
 }
 
@@ -1691,6 +1721,7 @@ static void taskSerial() {
       hrAddress = NimBLEAddress(std::string("DE:AD:BE:EF:00:01"), BLE_ADDR_PUBLIC);
       hrConnectResult = -1;
       xTaskNotifyGive(hrConnectHandle);
+      hrState = HR_CONNECTING;          // mostra il cuore rosso lampeggiante (acquisizione)
       Serial.println("test connect: richiesta al worker (core 0)");
     }
     else if (c == 'd') {
