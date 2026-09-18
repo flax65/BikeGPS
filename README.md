@@ -110,19 +110,27 @@ Se il BLE è scollegato il valore diventa `---` e compare `no BLE`
 
 Sketch separato: `esp32/BikeGPS_TDisplayS3/` (il codice BLE/parsing è identico).
 Schermo **verticale 170x320** (rotazione 0; basta cambiare `ROTATION` per
-l'orizzontale) — **3 pagine** in entrambi gli orientamenti:
+l'orizzontale) — **5 pagine**, ciclabili con il tasto destro:
 
 | Pagina | Contenuto |
 |---|---|
-| **RIDE** | velocità gigante (font 7-segment 48 px) + distanza, tempo, media, max |
-| **STATS** | griglia: distanza, tempo, media, max, quota, pendenza |
-| **SYS** | BLE, cardio, satelliti, batteria (%, V), heap libero, uptime |
+| **RIDE** | velocità gigante + distanza, tempo, media, max |
+| **COST SPEED** | allenamento a **velocità costante**: velocità gigante, target, scostamento, barra, bpm/zona, distanza, tempo in target |
+| **COST BPM** | allenamento a **carico costante**: battito gigante colorato per zona, target, scostamento, barra zone, velocità, tempo in target |
+| **SETUP SOGLIE** | 4 soglie cardiache in bpm (limiti Z1|Z2 … Z4|Z5), barra delle zone, legenda comandi |
+| **DIAG** | BLE, cardio, satelliti, batteria, quota, pendenza, heap, uptime |
 
-La griglia è 2×3 in verticale e 3×2 in orizzontale (calcolata a runtime).
+### Comandi (2 tastini integrati)
 
-Pulsanti integrati:
-- **GPIO0** (BOOT) corto → pagina avanti, tenuto premuto (>0,8 s) → retroilluminazione on/off
-- **GPIO14** corto → pagina indietro
+| Tasto | Pressione | Azione |
+|---|---|---|
+| **DESTRO** (GPIO14) | corta | pagina successiva; in SETUP = campo successivo |
+| **DESTRO** | lunga | torna alla pagina RIDE |
+| **SINISTRO** (GPIO0) | corta | **+1** sul valore (target o soglia) |
+| **SINISTRO** | lunga | nelle pagine di allenamento: **cattura il valore attuale come target**; in SETUP: **-1**; su RIDE/DIAG: **retroilluminazione** |
+
+Soglie, target e ultima pagina sono salvati in **NVS** (sopravvivono al riavvio).
+Default: soglie `102 / 119 / 136 / 153` bpm (FCmax 170), target `25.0 km/h` e `150 bpm`.
 
 Compila e carica (lo sketch usa un `tft_setup.h` locale, quindi non serve
 modificare `~/Arduino/libraries/TFT_eSPI/User_Setup.h`):

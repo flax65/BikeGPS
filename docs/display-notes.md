@@ -82,25 +82,42 @@ release ufficiale **V2.5.43** (tag GitHub con la V maiuscola) e copiato in
 `~/Arduino/libraries/TFT_eSPI/Fonts/`. `diff -rq` con la release: l'unica altra
 differenza è `User_Setup.h` (personalizzato GC9A01, da tenere).
 
-### Layout scelto
+### Layout scelto (5 pagine)
 
-**Verticale (170x320, rotazione 0 — impostazione attuale)** — 3 pagine:
-- **Pagina RIDE**: velocità gigante (font 7-segment 48 px) che occupa tutta la
-  larghezza in alto + griglia 2x2 sotto (DIST, TEMPO, MEDIA, MAX).
-- **Pagina STATS**: griglia 2x3 a tutta altezza (DIST, TEMPO, MEDIA, MAX, QUOTA,
-  PENDENZA).
-- **Pagina SYS**: griglia 2x3 (BLE, CARDIO, SATELLITI, BATTERIA, HEAP, UPTIME).
+**Verticale (170x320, rotazione 0 — impostazione attuale)**
+1. **RIDE**: velocità gigante + griglia 2x2 (DIST, TEMPO, MEDIA, MAX).
+2. **COST SPEED**: riga target, barra delle zone, velocità gigante (verde in
+   target), scostamento `^/v` con barra centrata, riga info (HR/zona/distanza),
+   tempo passato in target.
+3. **COST BPM**: come sopra ma il dato gigante è il battito, colorato con la
+   zona attiva; l'ospite è la velocità.
+4. **SETUP SOGLIE**: 4 righe (limiti Z1|Z2 … Z4|Z5) con selezione evidenziata,
+   barra delle zone, legenda comandi.
+5. **DIAG**: griglia 2x4 (BLE, cardio, satelliti, batteria, quota, pendenza,
+   heap, uptime).
 
-**Orizzontale (320x170, rotazione 1)** — 3 pagine:
-- **RIDE**: velocità gigante a sinistra + DIST/TEMPO in basso e MEDIA/MAX a destra.
-- **STATS**: griglia 3x2 (DIST, TEMPO, MEDIA, MAX, QUOTA, PENDENZA).
-- **SYS**: griglia 3x2 (BLE, CARDIO, SATELLITI, BATTERIA, HEAP, UPTIME).
+**Orizzontale (320x170, rotazione 1)**: le stesse pagine con le pagine di
+allenamento a due colonne (le griglie diventano 4x2).
 
-La geometria è scelta a runtime in `setupGeometry()`/`setGrid()` in base a
-`tft.width()/height()`, quindi basta cambiare `ROTATION` (0/2 verticale,
-1/3 orizzontale) per passare da un layout all'altro.
+La geometria è scelta a runtime in `setupGeometry()`/`setGrid()`/`costGeometry()`
+in base a `tft.width()/height()`: basta cambiare `ROTATION` (0/2 verticale,
+1/3 orizzontale).
 
-Comune ai due orientamenti:
+### Comandi
+
+| Tasto | Pressione | Azione |
+|---|---|---|
+| DESTRO (GPIO14) | corta | pagina successiva; in SETUP = campo successivo |
+| DESTRO | lunga (>0,8 s) | torna a RIDE |
+| SINISTRO (GPIO0) | corta | +1 sul valore (target o soglia) |
+| SINISTRO | lunga | pagine allenamento: cattura valore attuale come target; SETUP: -1; RIDE/DIAG: retroilluminazione |
+
+In `COST SPEED` e `COST BPM`: tolleranza ±1 km/h / ±5 bpm, fondoscala barra
+deviazione ±5 km/h / ±15 bpm. Soglie, target e ultima pagina in **NVS**
+(`Preferences`, namespace `bikegps`): sopravvivono al riavvio.
+
+Colori zone: Z1 grigio, Z2 verde, Z3 giallo, Z4 arancio, Z5 rosso.
+Default soglie 102/119/136/153 bpm (FCmax 170).
 - Righe di stato in alto: `BikeGPS` + stato BLE (verde/rosso) + batteria %.
 - GPIO0 corto = pagina avanti; GPIO0 lungo (>0,8 s) = retroilluminazione;
   GPIO14 = pagina indietro.
