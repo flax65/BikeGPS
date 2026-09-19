@@ -32,14 +32,46 @@
  * Librerie: NimBLE-Arduino (>=2.x), TFT_eSPI (setup in tft_setup.h locale)
  * Scheda:   esp32:esp32:lilygo_t_display_s3
  *
+ * Consumo: profilo a basso consumo attivo di default (blocco "risparmio energia"
+ * in cima): WiFi spento, CPU a 80 MHz, advertising BLE a 500 ms e backlight
+ * regolabile. Per tornare al profilo pieno compilare con -DLP_ENABLE=0.
+ *
  * ATTENZIONE: compila e carica con lo STESSO FQBN, altrimenti
  * arduino-cli puo' sbagliare i parametri di flash ("Unexpected chip ID").
  */
+
+// ---------------------------------------------------------------- risparmio energia
+// BikeGPS non usa il WiFi: lo spegniamo esplicitamente e abbassiamo la CPU.
+// Le manopole si possono forzare in compilazione senza toccare il file, es.:
+//   arduino-cli compile -b esp32:esp32:lilygo_t_display_s3 \
+//     --build-property "compiler.cpp.extra_flags=-DLP_CPU_MHZ=240 -DLP_ENABLE=0" .
+// (questo blocco sta PRIMA degli include: LP_WIFI_OFF decide se includere WiFi.h)
+#ifndef LP_ENABLE
+#define LP_ENABLE     1     // 1 = profilo a basso consumo attivo, 0 = come prima
+#endif
+#ifndef LP_CPU_MHZ
+#define LP_CPU_MHZ    80    // 240 default / 160 compromesso / 80 minimo con BLE
+                            // (40 MHz NON e' affidabile con il controller BLE)
+#endif
+#ifndef LP_WIFI_OFF
+#define LP_WIFI_OFF   1     // spegne il WiFi (mai inizializzato da BikeGPS)
+#endif
+#ifndef LP_ADV_MS
+#define LP_ADV_MS     500   // periodo advertising BLE in ms (0 = default 100 ms)
+                            // piu' lungo = meno consumo, ma il telefono ci mette
+                            // piu' a ritrovare la scheda dopo una disconnessione
+#endif
+#ifndef LP_BL_DUTY
+#define LP_BL_DUTY    255   // retroilluminazione 0..255 (255 = 100%, 128 = 50%)
+#endif
 
 #include <TFT_eSPI.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>   // soglie e target salvati in flash (NVS)
 #include "vlw_fonts.h"      // font VLW antialiased generati (16/26/48 px)
+#if LP_WIFI_OFF
+#include <WiFi.h>          // solo per spegnere esplicitamente il WiFi
+#endif
 
 // ---------------------------------------------------------------- pin scheda
 #define PIN_BTN1      0     // pulsante integrato ("sinistro"): modifica i valori
@@ -1376,9 +1408,22 @@ static Button btn2 = {BTN_PAGE, HIGH, 0, false, false};
 
 static void setBacklight(bool on) {
   backlightOn = on;
+#if LP_ENABLE
+  ledcWrite(TFT_BL, on ? LP_BL_DUTY : 0);   // PWM: la luminosita' e' regolabile
+#else
   digitalWrite(TFT_BL, on ? TFT_BACKLIGHT_ON : !TFT_BACKLIGHT_ON);
+#endif
 #if SERIAL_DEBUG
   Serial.printf("backlight %s\n", on ? "ON" : "OFF");
+#endif
+}
+
+// stato del risparmio energia (usato dal comando seriale 's' e nei log di avvio)
+static int wifiModeForLog() {
+#if LP_WIFI_OFF
+  return (int)WiFi.getMode();   // 0 = WIFI_OFF
+#else
+  return -1;
 #endif
 }
 
@@ -1388,6 +1433,9 @@ static void printStatus() {
                 backlightOn, (int)simEnabled, (int)tripActive, (unsigned long)(tripMs / 1000),
                 TFT_BL, digitalRead(TFT_BL), PIN_LCD_POWER, digitalRead(PIN_LCD_POWER),
                 (unsigned)ESP.getFreeHeap(), page + 1, pageCount, (int)portrait, (unsigned long)(millis() / 1000));
+  Serial.printf("power: cpu=%uMHz apb=%uMHz wifi=%d adv=%ums bl=%d\n",
+                (unsigned)getCpuFrequencyMhz(), (unsigned)(getApbFrequency() / 1000000),
+                wifiModeForLog(), LP_ADV_MS, LP_BL_DUTY);
   Serial.printf("tasti: SET(btn1,%d)=%d PAGE(btn2,%d)=%d | soglie: %d %d %d %d | tgtSpeed=%.1f tgtHr=%d | campo=%d\n",
                 PIN_BTN1, digitalRead(PIN_BTN1), PIN_BTN2, digitalRead(PIN_BTN2),
                 zoneLim[0], zoneLim[1], zoneLim[2], zoneLim[3], targetSpeed, targetHr, setupField);
@@ -1573,6 +1621,29 @@ void setup() {
   Serial.println("\nBikeGPS T-Display-S3");
 #endif
 
+#if LP_ENABLE
+  // CPU: va impostata subito, prima di inizializzare BLE e pannello.
+  // 80 MHz e' il minimo sicuro con il controller BLE. Il bus TFT e' in
+  // bit-banging, quindi ne risente: misurato a 80 MHz fillScreen 38,6 ms
+  // (era 27,5 a 240), cambio pagina RIDE 127,8 ms (era 68,8).
+  setCpuFrequencyMhz(LP_CPU_MHZ);
+#if SERIAL_DEBUG
+  Serial.printf("power: CPU %u MHz, APB %u MHz\n",
+                (unsigned)getCpuFrequencyMhz(), (unsigned)(getApbFrequency() / 1000000));
+#endif
+#endif
+
+#if LP_WIFI_OFF
+  // BikeGPS non usa il WiFi: spegnimento esplicito (driver init + stop).
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_OFF);
+  WiFi.disconnect(true, true);
+#if SERIAL_DEBUG
+  Serial.printf("power: WiFi %s (mode=%d)\n",
+                WiFi.getMode() == WIFI_OFF ? "spento" : "ATTIVO", (int)WiFi.getMode());
+#endif
+#endif
+
   // alimentazione pannello: senza questo lo schermo resta nero
   pinMode(PIN_LCD_POWER, OUTPUT);
   digitalWrite(PIN_LCD_POWER, HIGH);
@@ -1649,6 +1720,11 @@ void setup() {
   adv->setName("BikeGPS");
   adv->addServiceUUID(SERVICE_UUID);
   adv->enableScanResponse(true);
+#if LP_ENABLE && LP_ADV_MS > 0
+  // advertising piu' rado: meno radio accesa, stesso servizio
+  adv->setMinInterval((uint16_t)(LP_ADV_MS * 8 / 5));   // unita' da 0,625 ms
+  adv->setMaxInterval((uint16_t)(LP_ADV_MS * 8 / 5));
+#endif
   adv->start();
 
 #if SERIAL_DEBUG
@@ -1820,6 +1896,20 @@ static void taskSerial() {
       Serial.printf("scheduler: esecuzioni=%lu jitterMax=%lu ms | hrConnect=%d\n",
                     (unsigned long)schedRuns, (unsigned long)schedMaxJitter, (int)hrConnectResult);
       schedMaxJitter = 0;
+    }
+    else if (c == 'C') {
+      // test consumi: cicla la frequenza della CPU (240 -> 160 -> 80 -> 40 MHz).
+      // Utile per misurare il consumo a banco senza ricompilare.
+      static const uint32_t freqs[] = {240, 160, 80, 40};
+      uint32_t cur = getCpuFrequencyMhz();
+      uint8_t idx = 0;
+      for (uint8_t i = 0; i < 4; i++) if (freqs[i] == cur) { idx = i; break; }
+      idx = (idx + 1) % 4;
+      bool ok = setCpuFrequencyMhz(freqs[idx]);
+      Serial.printf("CPU: %lu -> %lu MHz (ok=%d) APB=%lu MHz%s\n",
+                    (unsigned long)cur, (unsigned long)freqs[idx], (int)ok,
+                    (unsigned long)(getApbFrequency() / 1000000),
+                    (freqs[idx] <= 40) ? "  [40 MHz: BLE instabile!]" : "");
     }
     else if (c == 'y') {
       // test: attiva/disattiva la simulazione della velocita'
