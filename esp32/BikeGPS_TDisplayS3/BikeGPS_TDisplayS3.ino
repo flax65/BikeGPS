@@ -68,6 +68,8 @@
 #include <TFT_eSPI.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>   // soglie e target salvati in flash (NVS)
+#include <esp_sleep.h>     // deep sleep: l'unico "power off" possibile (niente load switch)
+#include <driver/rtc_io.h> // pull-up RTC per il risveglio con i tasti
 #include "vlw_fonts.h"      // font VLW antialiased generati (16/26/48 px)
 #if LP_WIFI_OFF
 #include <WiFi.h>          // solo per spegnere esplicitamente il WiFi
@@ -102,6 +104,24 @@
 
 #define HERO_RENDER_SEG 0
 #define HDR_H 26            // altezza della riga di stato in alto
+
+// ---------------------------------------------------------- modalita' test durata batteria
+// PROVVISORIA: datalogger della tensione batteria in flash + carico ciclico
+// automatico, per misurare quanto dura la batteria. Rimettere TEST_MODE a 0
+// a fine test (la versione normale non deve cambiare pagina da sola).
+#define TEST_MODE         0     // 1 = datalogger + cambio pagina automatici
+#ifndef TEST_LOG_PERIOD_S
+#define TEST_LOG_PERIOD_S 300   // campionamento batteria (s): 5 min
+#endif
+#ifndef TEST_PAGE_S
+#define TEST_PAGE_S       30    // cambio pagina automatico (carico ciclico)
+#endif
+#ifndef TEST_LOG_MAX
+#define TEST_LOG_MAX      256   // record conservati in flash (ring) = 21 h
+#endif
+#ifndef BATT_MAH
+#define BATT_MAH          140   // capacita' dichiarata della batteria (mAh)
+#endif
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -410,10 +430,112 @@ static int battPercent() {
   return p;
 }
 
+#if TEST_MODE
+// ---------------------------------------------------------------- datalogger batteria
+// Ring buffer di campioni in NVS (namespace "blog"): sopravvive alla scarica
+// completa e a un eventuale reset. Letto col comando seriale 'l'.
+struct __attribute__((packed)) BattRec { uint32_t t; uint16_t mv; };   // 6 byte
+static BattRec blogBuf[TEST_LOG_MAX];
+static uint16_t blogCount = 0;      // campioni validi
+static uint16_t blogPos   = 0;      // prossima posizione da scrivere (ring)
+
+static void blogSave() {
+  Preferences p;
+  p.begin("blog", false);
+  p.putUShort("n", blogCount);
+  p.putUShort("p", blogPos);
+  p.putBytes("r", blogBuf, sizeof(blogBuf));
+  p.end();
+}
+
+static void blogLoad() {
+  Preferences p;
+  p.begin("blog", true);
+  blogCount = p.getUShort("n", 0);
+  blogPos   = p.getUShort("p", 0);
+  p.getBytes("r", blogBuf, sizeof(blogBuf));
+  p.end();
+  if (blogCount > TEST_LOG_MAX) blogCount = TEST_LOG_MAX;
+  if (blogPos >= TEST_LOG_MAX)  blogPos = 0;
+}
+
+static void blogReset() {
+  blogCount = 0;
+  blogPos = 0;
+  blogSave();
+}
+
+static void blogSample() {
+  float v = (battFiltered > 0.5f) ? battFiltered : battVolts();
+  blogBuf[blogPos].t  = millis();
+  blogBuf[blogPos].mv = (uint16_t)(v * 1000.0f + 0.5f);
+  blogPos = (uint16_t)((blogPos + 1) % TEST_LOG_MAX);
+  if (blogCount < TEST_LOG_MAX) blogCount++;
+  blogSave();
+#if SERIAL_DEBUG
+  Serial.printf("battlog: %u campioni, ultimo %u mV @ %lus\n",
+                blogCount, blogBuf[(blogPos + TEST_LOG_MAX - 1) % TEST_LOG_MAX].mv,
+                (unsigned long)(millis() / 1000));
+#endif
+}
+
+static int recPct(uint16_t mv) {
+  int p = (int)((mv / 1000.0f - 3.30f) / 0.90f * 100.0f + 0.5f);
+  if (p < 0) p = 0;
+  if (p > 100) p = 100;
+  return p;
+}
+
+static void printDrainLog() {
+  Serial.printf("=== CURVA DI SCARICA === batteria %u mAh, campioni ogni %us\n",
+                (unsigned)BATT_MAH, (unsigned)TEST_LOG_PERIOD_S);
+  if (blogCount == 0) { Serial.println("log vuoto (nessun campione)"); return; }
+  const uint16_t start = (uint16_t)((blogPos + TEST_LOG_MAX - blogCount) % TEST_LOG_MAX);
+  BattRec *prev = nullptr;
+  bool nonMono = false;
+  for (uint16_t i = 0; i < blogCount; i++) {
+    BattRec *r = &blogBuf[(start + i) % TEST_LOG_MAX];
+    if (prev && r->t < prev->t) nonMono = true;
+    Serial.printf("  %8.2f h  %5u mV  %3d%%\n", r->t / 3600000.0f, r->mv, recPct(r->mv));
+    prev = r;
+  }
+  BattRec *f = &blogBuf[start];
+  BattRec *l = &blogBuf[(blogPos + TEST_LOG_MAX - 1) % TEST_LOG_MAX];
+  const float dtH = (l->t - f->t) / 3600000.0f;
+  const float p0  = recPct(f->mv), p1 = recPct(l->mv);
+  Serial.printf("--- riepilogo ---\n  campioni=%u  durata=%.2f h  %.2f -> %.2f V\n",
+                blogCount, dtH, f->mv / 1000.0f, l->mv / 1000.0f);
+  if (nonMono) Serial.println("  ATTENZIONE: tempo non monotono (reset durante il test?)");
+  if (dtH <= 0.0f) { Serial.println("  dati insufficienti per la stima"); return; }
+  const float dPct = p0 - p1;
+  if (dPct <= 0.5f) { Serial.println("  batteria stabile o in carica: nessuna stima"); return; }
+  const float rate = dPct / dtH;                             // %/h
+  Serial.printf("  scarica: %.1f %% in %.2f h  =>  %.1f %%/h\n", dPct, dtH, rate);
+  Serial.printf("  autonomia da %.0f%%: %.1f h (%.1f giorni)\n", p0, p0 / rate, p0 / rate / 24.0f);
+  Serial.printf("  autonomia da 100%%: %.1f h (%.1f giorni)\n", 100.0f / rate, 100.0f / rate / 24.0f);
+  Serial.printf("  corrente media stimata: %.1f mA\n", (float)BATT_MAH * rate / 100.0f);
+}
+#endif  // TEST_MODE
+
 // ---------------------------------------------------------------- pagine
 enum Page { P_RIDE, P_SETUP, P_DIAG, PAGE_COUNT };
 static uint8_t page = P_RIDE;
 static bool backlightOn = true;
+static uint8_t blDuty = LP_BL_DUTY;   // luminosita' corrente (modificabile a caldo col comando 'B')
+
+// ---------------------------------------------------------- risparmio: luminosita' adattiva
+// 100% per i primi BL_FULL_MS, poi rampa lineare fino a BL_MIN_DUTY in BL_RAMP_MS,
+// poi display spento (DISPOFF + backlight 0). Qualsiasi tasto riporta al 100% e
+// ricomincia il ciclo. Il comando 'B' disattiva la logica per i test manuali, 'A' la riattiva.
+#define BL_OFF_ENABLE    0                   // 1 = dopo la fase al 10% spegne il display; 0 = resta al 10%
+#define BL_FULL_MS       10000UL             // 10 s a piena luminosita'
+#define BL_RAMP_MS       60000UL             // 60 s di rampa 100% -> 10%
+#define BL_MIN_HOLD_MS   60000UL             // (solo se BL_OFF_ENABLE) quanto resta al 10% prima di spegnersi
+#define BL_MIN_DUTY      26                  // 10% di 255
+#define BL_OFF_AFTER_MS  (BL_FULL_MS + BL_RAMP_MS + BL_MIN_HOLD_MS)
+static bool     autoDim    = true;           // logica automatica attiva
+static uint32_t blIdleAt   = 0;              // ultimo tasto premuto
+static bool     blPanelOff = false;          // pannello in DISPOFF
 static uint32_t bootTime = 0;     // usato per ignorare i tasti nei primi istanti dopo il boot
 
 // Pagina successiva/precedente. La SETUP (soglie cardio) non fa parte del giro:
@@ -426,37 +548,14 @@ static uint8_t advancePage(uint8_t p, int dir) {
   return p;
 }
 
-// ---------------------------------------------------------------- allenamento (soglie e target)
+// ---------------------------------------------------------------- allenamento (soglie cardio)
 // Soglie cardiache = limiti Z1|Z2, Z2|Z3, Z3|Z4, Z4|Z5 (bpm).
-// Default per FCmax 170: 102 / 119 / 136 / 153 -> 150 bpm cade nella Z4.
+// Default per FCmax 170: 102 / 119 / 136 / 153.
 #define ZONE_COUNT 5
 #define N_ZLIM     4
 static int zoneLim[N_ZLIM] = {102, 119, 136, 153};
 static const char *const ZONE_NAMES[ZONE_COUNT] = {"Z1", "Z2", "Z3", "Z4", "Z5"};
 static uint16_t zoneCol[ZONE_COUNT];       // riempiti in setup()
-
-static float targetSpeed = 25.0f;          // km/h (pagina COST SPEED)
-static int   targetHr    = 150;            // bpm (pagina COST BPM)
-
-// target velocita': intervallo selezionabile e passo del tasto sinistro
-#define TGT_SPEED_MIN  25.0f
-#define TGT_SPEED_MAX  35.0f
-#define TGT_SPEED_STEP  1.0f
-
-// target battito
-#define TGT_HR_MIN  80
-#define TGT_HR_MAX  200
-
-// riporta il target velocita' nell'intervallo (con ritorno al minimo se si supera il massimo)
-static void clampTargetSpeed(bool wrap) {
-  if (wrap && targetSpeed > TGT_SPEED_MAX) targetSpeed = TGT_SPEED_MIN;
-  else if (targetSpeed < TGT_SPEED_MIN)     targetSpeed = TGT_SPEED_MIN;
-  else if (targetSpeed > TGT_SPEED_MAX)     targetSpeed = TGT_SPEED_MAX;
-}
-#define TOLL_SPEED 1.0f                    // tolleranza target velocita' (km/h)
-#define TOLL_HR    5                       // tolleranza target battito (bpm)
-#define DEV_RANGE_SPEED 5.0f               // fondo scala barra deviazione (km/h)
-#define DEV_RANGE_HR    15                 // fondo scala barra deviazione (bpm)
 
 static uint8_t setupField = 0;             // campo selezionato nella pagina SETUP
 static Preferences prefs;
@@ -969,7 +1068,6 @@ static void fmtUptime(char *buf, size_t n) {
 }
 
 // etichette delle pagine a griglia (usate anche dalla pagina RIDE in verticale)
-static const char *const STATS_LABELS[6] = {"DIST km", "TEMPO", "MEDIA km/h", "MAX km/h", "QUOTA m", "PENDENZA %"};
 static const char *const RIDE_LABELS[3]  = {"TEMPO", "CADENZA", "WATT"};
 static const char *const DIAG_LABELS[8]  = {"BLE", "CARDIO bpm", "SATELLITI", "BATTERIA", "QUOTA m", "PENDENZA %", "HEAP", "UPTIME"};
 
@@ -1369,25 +1467,17 @@ static void drawValues() {
 static void saveSettings() {
   prefs.begin("bikegps", false);
   prefs.putBytes("zoneLim", zoneLim, sizeof(zoneLim));
-  prefs.putFloat("tgtSpeed", targetSpeed);
-  prefs.putInt("tgtHr", targetHr);
   prefs.end();
 #if SERIAL_DEBUG
-  Serial.printf("NVS salvata: limite=%d tgtSpeed=%.1f tgtHr=%d\n",
-                zoneLim[setupField], targetSpeed, targetHr);
+  Serial.printf("NVS salvata: limite=%d\n", zoneLim[setupField]);
 #endif
 }
 
 static void loadSettings() {
   prefs.begin("bikegps", true);
   if (prefs.isKey("zoneLim")) prefs.getBytes("zoneLim", zoneLim, sizeof(zoneLim));
-  targetSpeed = prefs.getFloat("tgtSpeed", targetSpeed);
-  targetHr    = prefs.getInt("tgtHr", targetHr);
   prefs.end();
   page = P_RIDE;                 // si parte sempre dalla pagina RIDE
-  clampTargetSpeed(false);
-  if (targetHr < TGT_HR_MIN) targetHr = TGT_HR_MIN;
-  if (targetHr > TGT_HR_MAX) targetHr = TGT_HR_MAX;
   for (int i = 1; i < N_ZLIM; i++) if (zoneLim[i] <= zoneLim[i - 1]) zoneLim[i] = zoneLim[i - 1] + 1;
 }
 
@@ -1409,13 +1499,56 @@ static Button btn2 = {BTN_PAGE, HIGH, 0, false, false};
 static void setBacklight(bool on) {
   backlightOn = on;
 #if LP_ENABLE
-  ledcWrite(TFT_BL, on ? LP_BL_DUTY : 0);   // PWM: la luminosita' e' regolabile
+  ledcWrite(TFT_BL, on ? blDuty : 0);   // PWM: la luminosita' e' regolabile
 #else
   digitalWrite(TFT_BL, on ? TFT_BACKLIGHT_ON : !TFT_BACKLIGHT_ON);
 #endif
 #if SERIAL_DEBUG
   Serial.printf("backlight %s\n", on ? "ON" : "OFF");
 #endif
+}
+
+// ---------------------------------------------------------------- spegnimento
+// La scheda non ha un load switch/PMIC: non esiste un comando che taglia la
+// batteria. Il "power off" e' quindi un deep sleep (decine di uA): display,
+// pannello e radio spenti, batteria che resta collegata e continua a caricarsi
+// se c'e' l'USB. Si riaccende premendo uno dei due tasti (EXT1, attivo basso).
+static void powerOff() {
+#if SERIAL_DEBUG
+  Serial.println("power off: deep sleep (premi un tasto per riaccendere)");
+#endif
+  saveSettings();                  // il task nvs non girera' piu'
+
+  // display: display off + sleep, poi via l'alimentazione del pannello
+  tft.writecommand(0x28);          // DISPOFF
+  tft.writecommand(0x10);          // SLPIN
+  setBacklight(false);
+#if LP_ENABLE
+  ledcDetach(TFT_BL);              // il PWM non sopravvive al deep sleep
+#endif
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, !TFT_BACKLIGHT_ON);
+  digitalWrite(PIN_LCD_POWER, LOW);
+
+  NimBLEDevice::deinit(true);      // radio spenta
+
+  // mantiene bassi retroilluminazione e alimentazione pannello mentre dorme
+  gpio_hold_en((gpio_num_t)TFT_BL);
+  gpio_hold_en((gpio_num_t)PIN_LCD_POWER);
+  gpio_deep_sleep_hold_en();
+
+  // risveglio: uno qualunque dei due tasti (pull-up RTC mantenuti accesi)
+  rtc_gpio_pullup_en((gpio_num_t)BTN_SET);
+  rtc_gpio_pulldown_dis((gpio_num_t)BTN_SET);
+  rtc_gpio_pullup_en((gpio_num_t)BTN_PAGE);
+  rtc_gpio_pulldown_dis((gpio_num_t)BTN_PAGE);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+  esp_sleep_enable_ext1_wakeup((1ULL << BTN_SET) | (1ULL << BTN_PAGE),
+                               ESP_EXT1_WAKEUP_ANY_LOW);
+#if SERIAL_DEBUG
+  Serial.flush();
+#endif
+  esp_deep_sleep_start();          // da qui non si torna
 }
 
 // stato del risparmio energia (usato dal comando seriale 's' e nei log di avvio)
@@ -1435,10 +1568,11 @@ static void printStatus() {
                 (unsigned)ESP.getFreeHeap(), page + 1, pageCount, (int)portrait, (unsigned long)(millis() / 1000));
   Serial.printf("power: cpu=%uMHz apb=%uMHz wifi=%d adv=%ums bl=%d\n",
                 (unsigned)getCpuFrequencyMhz(), (unsigned)(getApbFrequency() / 1000000),
-                wifiModeForLog(), LP_ADV_MS, LP_BL_DUTY);
-  Serial.printf("tasti: SET(btn1,%d)=%d PAGE(btn2,%d)=%d | soglie: %d %d %d %d | tgtSpeed=%.1f tgtHr=%d | campo=%d\n",
+                wifiModeForLog(), LP_ADV_MS, blDuty);
+  Serial.printf("batteria: %.3f V (%d%%)\n", battFiltered, battPercent());
+  Serial.printf("tasti: SET(btn1,%d)=%d PAGE(btn2,%d)=%d | soglie: %d %d %d %d | campo=%d\n",
                 PIN_BTN1, digitalRead(PIN_BTN1), PIN_BTN2, digitalRead(PIN_BTN2),
-                zoneLim[0], zoneLim[1], zoneLim[2], zoneLim[3], targetSpeed, targetHr, setupField);
+                zoneLim[0], zoneLim[1], zoneLim[2], zoneLim[3], setupField);
 #endif
 }
 
@@ -1457,8 +1591,8 @@ static void onSetShort() {
   }
   if (changed) {
 #if SERIAL_DEBUG
-    Serial.printf("set: tgtSpeed=%.1f tgtHr=%d zoneLim=%d,%d,%d,%d\n",
-                  targetSpeed, targetHr, zoneLim[0], zoneLim[1], zoneLim[2], zoneLim[3]);
+    Serial.printf("set: zoneLim=%d,%d,%d,%d\n",
+                  zoneLim[0], zoneLim[1], zoneLim[2], zoneLim[3]);
 #endif
     markSettingsDirty();
     invalidateCache();
@@ -1539,11 +1673,16 @@ static void handleButtons() {
   bool s1 = digitalRead(btn1.pin);
   bool s2 = digitalRead(btn2.pin);
 
+  // qualsiasi tasto riporta la retroilluminazione al 100% e riavvia il ciclo
+  if (s1 == LOW || s2 == LOW) blIdleAt = millis();
+
   // --- entrambi i tasti premuti per >1 s: apre/chiude la pagina SOGLIE CARDIO
   static uint32_t bothSince = 0;
   static bool bothFired = false;
   if (s1 == LOW && s2 == LOW) {
     if (bothSince == 0) bothSince = millis();
+    // entrambi i tasti tenuti per >3 s: spegnimento (deep sleep)
+    if (millis() - bothSince > 3000) powerOff();
     if (!bothFired && millis() - bothSince > 1000) {
       bothFired = true;
       if (page == P_SETUP) {
@@ -1644,6 +1783,20 @@ void setup() {
 #endif
 #endif
 
+  // al risveglio dal deep sleep retroilluminazione e pannello erano "held":
+  // rilasciarli, altrimenti gli schermi restano spenti.
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)TFT_BL);
+  gpio_hold_dis((gpio_num_t)PIN_LCD_POWER);
+#if SERIAL_DEBUG
+  {
+    esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
+    if (wc != ESP_SLEEP_WAKEUP_UNDEFINED)
+      Serial.printf("wake da deep sleep: cause=%d (%s)\n", (int)wc,
+                    wc == ESP_SLEEP_WAKEUP_EXT1 ? "tasti" : "altra");
+  }
+#endif
+
   // alimentazione pannello: senza questo lo schermo resta nero
   pinMode(PIN_LCD_POWER, OUTPUT);
   digitalWrite(PIN_LCD_POWER, HIGH);
@@ -1653,15 +1806,19 @@ void setup() {
   btn1.last = digitalRead(btn1.pin);
   btn2.last = digitalRead(btn2.pin);
   bootTime = millis();
+  blIdleAt = millis();         // parte il ciclo della luminosita' adattiva
 
   // batteria: partitore 1:2, attenuazione massima per arrivare a ~4,2 V
   analogSetPinAttenuation(PIN_BAT, ADC_11db);
 
-  Serial.printf("ledcAttach(BL=%d) -> %d  (duty 50%% = %d)\n",
-                TFT_BL, (int)ledcAttach(TFT_BL, 5000, 8), (50 * 255) / 100);
   tft.init();
   tft.setRotation(ROTATION);
   setupGeometry();
+
+  // tft.init() riconfigura TFT_BL come uscita digitale (TFT_eSPI.cpp): il PWM
+  // del backlight va (ri)attivato DOPO l'init, altrimenti ledcWrite non ha effetto.
+  Serial.printf("ledcAttach(BL=%d) -> %d  (duty 50%% = %d)\n",
+                TFT_BL, (int)ledcAttach(TFT_BL, 5000, 8), (50 * 255) / 100);
   setBacklight(true);
   simEnabled = SIM_DEFAULT_ON;   // simulazione attiva all'avvio (vedi SIM_DEFAULT_ON)
 
@@ -1687,6 +1844,13 @@ void setup() {
 
   // soglie, target e ultima pagina recuperati dalla flash
   loadSettings();
+#if TEST_MODE
+  blogLoad();
+#if SERIAL_DEBUG
+  Serial.printf("test durata: log con %u campioni, carico ciclico ogni %us, batteria %u mAh\n",
+                blogCount, (unsigned)TEST_PAGE_S, (unsigned)BATT_MAH);
+#endif
+#endif
 #if SERIAL_DEBUG
   printStatus();
 #endif
@@ -1776,6 +1940,62 @@ static void taskSaveSettings() {            // 1 Hz: salva in flash solo se serv
   if (!settingsDirty || millis() - settingsDirtyAt < 1000) return;
   saveSettings();
   settingsDirty = false;
+}
+
+#if TEST_MODE
+// carico ciclico del test durata: alterna RIDE <-> DIAG e tiene la simulazione
+// attiva, cosi' il consumo misurato e' quello "in funzione", non a schermo fermo.
+static void taskStress() {
+  simEnabled = true;
+  page = (page == P_RIDE) ? P_DIAG : P_RIDE;
+  invalidateCache();
+  drawFull();
+}
+
+static void taskBattLog() { blogSample(); }   // campionamento batteria in flash
+#endif
+
+// risparmio energetico del display: calcola la luminosita' in base al tempo
+// dall'ultimo tasto e spegne del tutto il display quando non serve.
+static void taskAutoDim() {
+  if (!autoDim || !backlightOn) return;
+  const uint32_t idle = millis() - blIdleAt;
+  uint8_t d;
+  if (idle < BL_FULL_MS) {
+    d = LP_BL_DUTY;
+  } else if (idle < BL_FULL_MS + BL_RAMP_MS) {
+    const uint32_t k = idle - BL_FULL_MS;
+    d = (uint8_t)(LP_BL_DUTY - (uint32_t)(LP_BL_DUTY - BL_MIN_DUTY) * k / BL_RAMP_MS);
+  } else if (BL_OFF_ENABLE && idle >= BL_OFF_AFTER_MS) {
+    d = 0;                               // display spento (solo con BL_OFF_ENABLE)
+  } else {
+    d = BL_MIN_DUTY;                     // resta al 10%
+  }
+  if (d == 0) {
+    if (!blPanelOff) {
+      blDuty = 0;
+      ledcWrite(TFT_BL, 0);
+      tft.writecommand(0x28);            // DISPOFF: pannello spento ma GRAM conservata
+      blPanelOff = true;
+#if SERIAL_DEBUG
+      Serial.println("display: spento (inattivita')");
+#endif
+    }
+  } else {
+    if (blPanelOff) {
+      tft.writecommand(0x29);            // DISPON: si riaccende
+      blPanelOff = false;
+      invalidateCache();
+      drawFull();
+#if SERIAL_DEBUG
+      Serial.println("display: riacceso");
+#endif
+    }
+    if (d != blDuty) {
+      blDuty = d;
+      ledcWrite(TFT_BL, d);
+    }
+  }
 }
 
 // comandi di test da seriale: n = pagina avanti, p = indietro, b = retroilluminazione
@@ -1919,6 +2139,31 @@ static void taskSerial() {
       heroSegLen = -1;
       Serial.printf("simulazione velocita': %s\n", simEnabled ? "ON" : "OFF");
     }
+#if TEST_MODE
+    else if (c == 'l') {
+      printDrainLog();                     // curva di scarica + durata stimata
+    } else if (c == 'L') {
+      blogReset();
+      Serial.println("log batteria azzerato");
+    }
+#endif
+    else if (c == 'B') {
+      // test: cicla la luminosita' del backlight (per misurare il consumo a banco).
+      // Disattiva la luminosita' adattiva: si torna al comportamento automatico con 'A'.
+      autoDim = false;
+      static const uint8_t lv[] = {255, 200, 160, 128, 96, 64, 32, 0};
+      uint8_t idx = 0;
+      for (uint8_t i = 0; i < sizeof(lv); i++) if (lv[i] == blDuty) { idx = i; break; }
+      blDuty = lv[(idx + 1) % sizeof(lv)];
+      setBacklight(backlightOn);
+      Serial.printf("backlight duty: %u/255 (%u%%) [auto-dim OFF]\n",
+                    blDuty, (unsigned)(blDuty * 100UL / 255));
+    } else if (c == 'A') {
+      // riattiva la luminosita' adattiva
+      autoDim = true;
+      blIdleAt = millis();
+      Serial.println("luminosita' adattiva: ON");
+    }
     else if (c == 'R') {
       // riavvio remoto della scheda
       Serial.println("riavvio...");
@@ -1984,6 +2229,7 @@ static void taskSerial() {
       digitalWrite(PIN_LCD_POWER, HIGH);
       tft.init();                       // re-init del pannello
       tft.setRotation(ROTATION);
+      ledcAttach(TFT_BL, 5000, 8);      // tft.init() rilascia il PWM del backlight
       setBacklight(true);
       drawFull();
       printStatus();
@@ -2006,6 +2252,11 @@ static TaskDef sched[] = {
   {"header",   2500, 0, taskHeader},
   {"nvs",      1000, 0, taskSaveSettings},
   {"battery",  1000, 0, taskBattery},
+  {"autodim",   100, 0, taskAutoDim},
+#if TEST_MODE
+  {"stress",  TEST_PAGE_S * 1000, 0, taskStress},
+  {"battlog", TEST_LOG_PERIOD_S * 1000, 0, taskBattLog},
+#endif
 };
 static const size_t N_TASKS = sizeof(sched) / sizeof(sched[0]);
 
